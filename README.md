@@ -143,7 +143,7 @@ both ways. Stop the UE with `tmux send-keys -t 5gsa-ocudu C-c`.
 ## The 49 patches
 
 All are on the `darwin-arm64` lineage over `release_26_10`; the series
-replays on the clean tag (77 files, 616 insertions, 129 deletions, 5 new
+replays on the clean tag (84 files, 1772 insertions, 129 deletions, 7 new
 files). Each commit message states the symptom, the cause and the choice
 made. Grouped by what they do:
 
