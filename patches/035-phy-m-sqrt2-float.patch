@@ -1,0 +1,76 @@
+From aa1d078dbde107b987d733fa02c639b2de6092a6 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:40 +0300
+Subject: [PATCH] phy: spell sqrt(2) as a float from M_SQRT2, not M_SQRT2f32
+
+M_SQRT2f32 is a glibc extension from ISO/IEC TS 18661-3, present in
+<math.h> only when _GNU_SOURCE is defined. Darwin's libm has M_SQRT2 but
+no f32 variants, so ssb_properties.h and the QPSK demodulators fail with
+"use of undeclared identifier". Use static_cast<float>(M_SQRT2), which
+has the same value and type on every libm.
+---
+ include/ocudu/ran/ssb/ssb_properties.h                      | 2 +-
+ .../upper/channel_modulation/demodulation_mapper_impl.cpp   | 2 +-
+ .../upper/channel_modulation/demodulation_mapper_qpsk.cpp   | 6 +++---
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/include/ocudu/ran/ssb/ssb_properties.h b/include/ocudu/ran/ssb/ssb_properties.h
+index acae427..66dd641 100644
+--- a/include/ocudu/ran/ssb/ssb_properties.h
++++ b/include/ocudu/ran/ssb/ssb_properties.h
+@@ -35,7 +35,7 @@ inline float ssb_pss_to_sss_epre_to_dB(ssb_pss_to_sss_epre value)
+ /// \brief Converts the PSS EPRE to SSS EPRE value to a linear amplitude.
+ inline float ssb_pss_to_sss_epre_to_amplitude(ssb_pss_to_sss_epre value)
+ {
+-  return (value == ssb_pss_to_sss_epre::dB_3) ? M_SQRT2f32 : 1.0F;
++  return (value == ssb_pss_to_sss_epre::dB_3) ? static_cast<float>(M_SQRT2) : 1.0F;
+ }
+ 
+ /// Labels for the different SS/PBCH block patterns defined in TS38.213 Section 4.1.
+diff --git a/lib/phy/upper/channel_modulation/demodulation_mapper_impl.cpp b/lib/phy/upper/channel_modulation/demodulation_mapper_impl.cpp
+index 9009333..78a3865 100644
+--- a/lib/phy/upper/channel_modulation/demodulation_mapper_impl.cpp
++++ b/lib/phy/upper/channel_modulation/demodulation_mapper_impl.cpp
+@@ -19,7 +19,7 @@ static log_likelihood_ratio demod_BPSK_symbol(cf_t z, float noise_var, float ran
+   if (!(noise_var > 0)) {
+     return 0;
+   }
+-  float l_value = 2.0F * M_SQRT2f32 * (std::real(z) + std::imag(z)) / noise_var;
++  float l_value = 2.0F * static_cast<float>(M_SQRT2) * (std::real(z) + std::imag(z)) / noise_var;
+   return log_likelihood_ratio::quantize(l_value, range_limit);
+ }
+ 
+diff --git a/lib/phy/upper/channel_modulation/demodulation_mapper_qpsk.cpp b/lib/phy/upper/channel_modulation/demodulation_mapper_qpsk.cpp
+index fbc0d8b..4c9c16a 100644
+--- a/lib/phy/upper/channel_modulation/demodulation_mapper_qpsk.cpp
++++ b/lib/phy/upper/channel_modulation/demodulation_mapper_qpsk.cpp
+@@ -49,7 +49,7 @@ static void demod_QPSK_avx2(log_likelihood_ratio* llr, const cf_t* symbol, const
+   __m256 rcp_noise_3_ = _mm256_permute2f128_ps(rcp_noise_2, rcp_noise_3, 0x31);
+ 
+   // Calculate l_value.
+-  __m256 GAIN      = _mm256_set1_ps(2.0F * M_SQRT2f32);
++  __m256 GAIN      = _mm256_set1_ps(2.0F * static_cast<float>(M_SQRT2));
+   __m256 l_value_0 = _mm256_mul_ps(_mm256_mul_ps(GAIN, symbols_0), rcp_noise_0_);
+   __m256 l_value_1 = _mm256_mul_ps(_mm256_mul_ps(GAIN, symbols_1), rcp_noise_1_);
+   __m256 l_value_2 = _mm256_mul_ps(_mm256_mul_ps(GAIN, symbols_2), rcp_noise_2_);
+@@ -89,7 +89,7 @@ static void demod_QPSK_neon(log_likelihood_ratio* llr, const cf_t* symbol, const
+   // float32x4_t   rcp_noise_3_ = noise_rep_1.val[1];
+ 
+   // Calculate l_value.
+-  float32x4_t GAIN      = vdupq_n_f32(2.0F * M_SQRT2f32);
++  float32x4_t GAIN      = vdupq_n_f32(2.0F * static_cast<float>(M_SQRT2));
+   float32x4_t l_value_0 = vmulq_f32(vmulq_f32(GAIN, symbols_0), noise_rep_0.val[0]);
+   float32x4_t l_value_1 = vmulq_f32(vmulq_f32(GAIN, symbols_1), noise_rep_0.val[1]);
+   float32x4_t l_value_2 = vmulq_f32(vmulq_f32(GAIN, symbols_2), noise_rep_1.val[0]);
+@@ -108,7 +108,7 @@ static log_likelihood_ratio demod_QPSK_symbol(float x, float noise_var)
+   if (!(noise_var > 0)) {
+     return log_likelihood_ratio(0);
+   }
+-  float l_value = 2.0F * M_SQRT2f32 * x / noise_var;
++  float l_value = 2.0F * static_cast<float>(M_SQRT2) * x / noise_var;
+   return log_likelihood_ratio::quantize(l_value, RANGE_LIMIT_FLOAT);
+ }
+ 
+-- 
+2.55.0
+

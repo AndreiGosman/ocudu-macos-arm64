@@ -1,0 +1,102 @@
+From 639b34c1f0632339dc396193a1101c698d94d8ad Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] support,phy: give std::min/std::max literals the type of the
+ other argument
+
+Several calls compare a uint64_t or a std::chrono::nanoseconds::rep with
+an UL or L literal. On glibc/x86-64 uint64_t is unsigned long and the
+nanoseconds representation is long, so the literal types match. On
+Darwin (and on every LLP64/LP64 ABI where uint64_t is unsigned long
+long) they do not, and std::min/std::max fail to deduce a common type.
+Spell the literals with the deduced type, uint64_t{...} and
+std::chrono::nanoseconds::rep{...}, which is the same value everywhere.
+---
+ include/ocudu/support/benchmark_utils.h                 | 4 ++--
+ lib/phy/metrics/phy_metrics_pdsch_processor_decorator.h | 4 ++--
+ lib/phy/metrics/phy_metrics_pusch_processor_decorator.h | 4 ++--
+ lib/phy/upper/metrics/aggregators/aggregator_helpers.h  | 2 +-
+ 4 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/include/ocudu/support/benchmark_utils.h b/include/ocudu/support/benchmark_utils.h
+index 9e88ca8..ffabafc 100644
+--- a/include/ocudu/support/benchmark_utils.h
++++ b/include/ocudu/support/benchmark_utils.h
+@@ -78,7 +78,7 @@ class benchmarker
+   unsigned get_percentile_width_throughput(double scaling) const
+   {
+     std::pair<uint64_t, uint64_t> max_meas = get_max_meas_time_ns();
+-    max_meas.first                         = std::max(max_meas.first, 1UL);
++    max_meas.first                         = std::max(max_meas.first, uint64_t{1});
+     double throughput_max                  = convert_to_throughput(max_meas.first, max_meas.second);
+ 
+     unsigned percentile_width = static_cast<unsigned>(std::ceil(std::log10(throughput_max * scaling))) + 2U;
+@@ -134,7 +134,7 @@ class benchmarker
+   /// \return The calculated throughput.
+   static double convert_to_throughput(uint64_t time_ns, size_t size)
+   {
+-    time_ns = std::max(time_ns, 1UL);
++    time_ns = std::max(time_ns, uint64_t{1});
+ 
+     // To get a more precise result with one decimal place, the throughput is calculated in hundreds of thousands of
+     // elements per second and then divided by ten when it is converted to a floating point number.
+diff --git a/lib/phy/metrics/phy_metrics_pdsch_processor_decorator.h b/lib/phy/metrics/phy_metrics_pdsch_processor_decorator.h
+index 0e2c02b..64e0fd2 100644
+--- a/lib/phy/metrics/phy_metrics_pdsch_processor_decorator.h
++++ b/lib/phy/metrics/phy_metrics_pdsch_processor_decorator.h
+@@ -49,7 +49,7 @@ public:
+     }
+     self_cpu_usage_ns.store(measurements.duration.count(), std::memory_order_relaxed);
+     elapsed_completion_and_return_ns |=
+-        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - start_time).count(), 0xffffffffL);
++        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - start_time).count(), std::chrono::nanoseconds::rep{0xffffffff});
+ 
+     report_metrics();
+   }
+@@ -60,7 +60,7 @@ private:
+   {
+     // Update elapsed time.
+     elapsed_completion_and_return_ns |=
+-        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - start_time).count(), 0xffffffffL) << 32;
++        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - start_time).count(), std::chrono::nanoseconds::rep{0xffffffff}) << 32;
+ 
+     // Report metrics.
+     report_metrics();
+diff --git a/lib/phy/metrics/phy_metrics_pusch_processor_decorator.h b/lib/phy/metrics/phy_metrics_pusch_processor_decorator.h
+index 2dec51b..289fadd 100644
+--- a/lib/phy/metrics/phy_metrics_pusch_processor_decorator.h
++++ b/lib/phy/metrics/phy_metrics_pusch_processor_decorator.h
+@@ -54,7 +54,7 @@ public:
+     }
+     cpu_time_usage_ns.store(measurements.duration.count(), std::memory_order_relaxed);
+     elapsed_data_and_return_ns |=
+-        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - time_start).count(), 0xffffffffL);
++        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - time_start).count(), std::chrono::nanoseconds::rep{0xffffffff});
+ 
+     // Notify metrics.
+     notify_metrics();
+@@ -84,7 +84,7 @@ private:
+ 
+     // Save data reporting time.
+     elapsed_data_and_return_ns |=
+-        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - time_start).count(), 0xffffffffL) << 32;
++        std::min(std::chrono::nanoseconds(std::chrono::steady_clock::now() - time_start).count(), std::chrono::nanoseconds::rep{0xffffffff}) << 32;
+ 
+     // Notify metrics.
+     notify_metrics();
+diff --git a/lib/phy/upper/metrics/aggregators/aggregator_helpers.h b/lib/phy/upper/metrics/aggregators/aggregator_helpers.h
+index da4ed51..3d03f7f 100644
+--- a/lib/phy/upper/metrics/aggregators/aggregator_helpers.h
++++ b/lib/phy/upper/metrics/aggregators/aggregator_helpers.h
+@@ -23,7 +23,7 @@ inline void update_minmax(uint64_t new_value, std::atomic<uint64_t>& max, std::a
+ constexpr uint64_t pack_slot_and_duration(slot_point slot, uint64_t duration_ns)
+ {
+   // Pack duration as 32 bits, maximum of approximately 4.29 seconds.
+-  uint64_t packed = std::min(duration_ns, 0xffffffffUL);
++  uint64_t packed = std::min(duration_ns, uint64_t{0xffffffff});
+ 
+   // Pack slot index which takes no more than 20 bits.
+   packed |= (slot.count() & 0xfffffUL) << 32UL;
+-- 
+2.55.0
+

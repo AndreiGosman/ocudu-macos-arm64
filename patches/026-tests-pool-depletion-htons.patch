@@ -1,0 +1,29 @@
+From 02182de5dd715cf6422d013e616b22291ba2d8e9 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:38:36 +0300
+Subject: [PATCH] tests: call htons without scope qualification in the UDP pool
+ depletion test
+
+Same portability point as in the UDP log sink: htons is a macro on
+Darwin, BSD and musl, where ::htons(0) fails with "expected
+unqualified-id". Drop the scope operator.
+---
+ .../gateways/udp_network_gateway_pool_depletion_test.cpp        | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/unittests/gateways/udp_network_gateway_pool_depletion_test.cpp b/tests/unittests/gateways/udp_network_gateway_pool_depletion_test.cpp
+index fa3cb6f..4bb170e 100644
+--- a/tests/unittests/gateways/udp_network_gateway_pool_depletion_test.cpp
++++ b/tests/unittests/gateways/udp_network_gateway_pool_depletion_test.cpp
+@@ -27,7 +27,7 @@ protected:
+ 
+     sockaddr_in tx_addr = {};
+     tx_addr.sin_family  = AF_INET;
+-    tx_addr.sin_port    = ::htons(0);
++    tx_addr.sin_port    = htons(0);
+ 
+     ASSERT_EQ(::inet_pton(AF_INET, client_address_v4.data(), &tx_addr.sin_addr), 1);
+     ASSERT_EQ(::bind(tx_sock_fd.value(), (sockaddr*)&tx_addr, sizeof(tx_addr)), 0);
+-- 
+2.55.0
+

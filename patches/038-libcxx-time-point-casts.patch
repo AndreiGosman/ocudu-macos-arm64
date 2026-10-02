@@ -1,0 +1,66 @@
+From db391dce88fa2ad913b47d30bf9997c4ae1efa56 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] phy,ru,mac: cast time points back to the system_clock
+ duration after adding nanoseconds
+
+Three places add a std::chrono::nanoseconds offset to a
+std::chrono::system_clock time point, or construct one from nanoseconds,
+and store the result in a time_point<system_clock>. With libstdc++ the
+system clock ticks in nanoseconds, so nothing changes type. With libc++
+it ticks in microseconds: the sum has a nanosecond period and the
+implicit conversion back would truncate, which the standard forbids, so
+the build fails with "no viable conversion".
+
+Make the conversion explicit with time_point_cast and duration_cast to
+system_clock::duration. On libstdc++ it is the identity; on libc++ it
+rounds toward zero to the clock's microsecond tick.
+---
+ lib/mac/mac_dl/mac_subframe_time_mapper_impl.cpp               | 2 +-
+ .../processors/downlink/downlink_processor_baseband_impl.cpp   | 3 ++-
+ lib/ru/ofh/ru_ofh_timing_notifier_impl.cpp                     | 3 ++-
+ 3 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/lib/mac/mac_dl/mac_subframe_time_mapper_impl.cpp b/lib/mac/mac_dl/mac_subframe_time_mapper_impl.cpp
+index 7aaf3ac..a33b8d7 100644
+--- a/lib/mac/mac_dl/mac_subframe_time_mapper_impl.cpp
++++ b/lib/mac/mac_dl/mac_subframe_time_mapper_impl.cpp
+@@ -77,7 +77,7 @@ atomic_subframe_time_mapper::time_point atomic_subframe_time_mapper::load_time(u
+     candidate += period;
+   }
+ 
+-  return time_point(std::chrono::nanoseconds(candidate));
++  return time_point(std::chrono::duration_cast<time_point::duration>(std::chrono::nanoseconds(candidate)));
+ }
+ 
+ uint64_t atomic_subframe_time_mapper::extract_sfn_sf_idx(uint64_t packed_mapping)
+diff --git a/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp b/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp
+index 0c0c3f0..d595f57 100644
+--- a/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp
++++ b/lib/phy/lower/processors/downlink/downlink_processor_baseband_impl.cpp
+@@ -131,7 +131,8 @@ downlink_processor_baseband_impl::process(baseband_gateway_timestamp timestamp)
+     trace_point tp = ru_tracer.now();
+     notifier->on_tti_boundary(
+         lower_phy_timing_context{.slot       = slot + nof_slot_tti_in_advance,
+-                                 .time_point = std::chrono::system_clock::now() + nof_slot_tti_in_advance_ns});
++                                 .time_point = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
++                                     std::chrono::system_clock::now() + nof_slot_tti_in_advance_ns)});
+     previous_slot = slot;
+     ru_tracer << trace_event("on_tti_boundary", tp);
+ 
+diff --git a/lib/ru/ofh/ru_ofh_timing_notifier_impl.cpp b/lib/ru/ofh/ru_ofh_timing_notifier_impl.cpp
+index d4d20e3..2647a25 100644
+--- a/lib/ru/ofh/ru_ofh_timing_notifier_impl.cpp
++++ b/lib/ru/ofh/ru_ofh_timing_notifier_impl.cpp
+@@ -35,6 +35,7 @@ void ru_ofh_timing_notifier_impl::on_new_symbol(const ofh::slot_symbol_point_con
+     timing_notifier.on_tti_boundary(tti_boundary_context{
+         .slot = slot_point_extended(symbol_point_context.symbol_point.get_slot(), symbol_point_context.hfn) +
+                 nof_slot_offset_du_ru,
+-        .time_point = symbol_point_context.time_point + nof_slots_offset_du_ru_ns});
++        .time_point = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
++            symbol_point_context.time_point + nof_slots_offset_du_ru_ns)});
+   }
+ }
+-- 
+2.55.0
+

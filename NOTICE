@@ -1,0 +1,39 @@
+ocudu-macos-arm64
+
+This repository contains patches, configuration files, shell scripts and
+documentation for building and running the OCUDU gNB on macOS with Apple
+Silicon. It does not contain or redistribute the OCUDU source tree or any
+binaries built from it.
+
+OCUDU
+  https://gitlab.com/ocudu/ocudu
+  Copyright (c) 2021-2026 Software Radio Systems Limited
+  Licensed under the BSD 3-Clause Open MPI variant license
+  (SPDX: BSD-3-Clause-Open-MPI), text in LICENSES/BSD-3-Clause-Open-MPI.txt
+  as shipped by upstream.
+  The files under patches/ are modifications to OCUDU source files and are
+  derivative works of OCUDU. They are offered under the same
+  BSD-3-Clause-Open-MPI terms as the files they modify.
+  config/gnb.yml is derived from configs/gnb_rf_b210_fdd_srsUE.yml in the
+  OCUDU tree, with the changes listed in README.md.
+
+srsRAN 4G
+  https://github.com/srsran/srsRAN_4G
+  Copyright (C) 2013-2026 Software Radio Systems Limited
+  Licensed under the GNU Affero General Public License v3.0.
+  config/srsue/ue.conf is derived from the srsRAN 4G example configuration
+  file srsue/ue.conf.example.
+
+Open5GS
+  https://github.com/open5gs/open5gs
+  Copyright (C) 2019-2026 by Sukchan Lee and contributors
+  Licensed under the GNU Affero General Public License v3.0.
+  No Open5GS file is included here. config/start-5gc-user.sh starts Open5GS
+  binaries with the configuration set of the open5gs-macos-arm64 kit.
+
+The test subscriber values (PLMN 001/01, IMSI 001010000000001, the K and OPc
+strings in config/srsue/ue.conf) are the public test vectors from the Open5GS
+documentation, not secrets. The IMEI is the srsRAN 4G example value.
+
+The kit's own files (README.md, NOTICE, config/render.sh, the two shell
+scripts) are released under the MIT license, see LICENSE.

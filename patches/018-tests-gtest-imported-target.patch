@@ -1,0 +1,32 @@
+From 50c6903999592c24f156ef7e94c0465592cf635f Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:41:24 +0300
+Subject: [PATCH] tests: link ocudu_gtest_main against the imported
+ GTest::gtest target
+
+ocudu_gtest_main named the GoogleTest library as a bare "gtest", which
+the linker resolves only when libgtest sits on its default search path.
+Every other test target in the tree uses the GTest::gtest imported
+target that find_package(GTest) provides, which carries the library's
+location. On a host where GoogleTest lives in a prefix such as Homebrew's
+/opt/homebrew/lib the bare name fails with "library 'gtest' not found"
+while the imported target links.
+
+Use GTest::gtest here as well.
+---
+ tests/test_doubles/utils/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/test_doubles/utils/CMakeLists.txt b/tests/test_doubles/utils/CMakeLists.txt
+index 85231fb..40a4ab6 100644
+--- a/tests/test_doubles/utils/CMakeLists.txt
++++ b/tests/test_doubles/utils/CMakeLists.txt
+@@ -5,4 +5,4 @@ add_library(test_rng test_rng.cpp)
+ target_link_libraries(test_rng PRIVATE ocudu_support)
+ 
+ add_library(ocudu_gtest_main ocudu_gtest_main.cpp)
+-target_link_libraries(ocudu_gtest_main PRIVATE test_rng ocudulog ocudu_support gtest)
++target_link_libraries(ocudu_gtest_main PRIVATE test_rng ocudulog ocudu_support GTest::gtest)
+-- 
+2.55.0
+

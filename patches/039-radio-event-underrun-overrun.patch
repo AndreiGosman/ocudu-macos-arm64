@@ -1,0 +1,199 @@
+From d693c5cb54bf8516712383753b84aa1d0f30e6a9 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] radio: rename the UNDERFLOW and OVERFLOW event types, which
+ clash with math.h macros
+
+<math.h> on Darwin and the BSDs defines the SVID error codes OVERFLOW
+and UNDERFLOW as plain macros when the full C namespace is visible,
+which is the default. Any header that includes <cmath> before
+radio_event_notifier.h then turns the enumerators radio_event_type::
+UNDERFLOW and OVERFLOW into integer literals and the enum definition and
+every use fail to parse.
+
+Rename them UNDERRUN and OVERRUN, the terms radio drivers use for the
+same conditions, in the enum, its to_string(), the UHD, ZeroMQ and
+Sidekiq drivers, the SDR RU event handler and metrics collector, and the
+radio notifier example. The strings reported to logs are unchanged.
+---
+ apps/examples/radio/radio_notifier_sample.h   | 4 ++--
+ include/ocudu/radio/radio_event_notifier.h    | 8 ++++----
+ lib/radio/sidekiq/radio_sidekiq_rx_stream.cpp | 2 +-
+ lib/radio/uhd/radio_uhd_rx_stream.cpp         | 2 +-
+ lib/radio/uhd/radio_uhd_tx_stream.cpp         | 2 +-
+ lib/radio/zmq/radio_zmq_rx_channel.cpp        | 2 +-
+ lib/radio/zmq/radio_zmq_tx_channel.cpp        | 2 +-
+ lib/ru/sdr/ru_radio_event_handler.h           | 4 ++--
+ lib/ru/sdr/ru_radio_metrics_collector.cpp     | 4 ++--
+ utils/trx_ocudu/trx_ocudu.cpp                 | 4 ++--
+ 10 files changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/apps/examples/radio/radio_notifier_sample.h b/apps/examples/radio/radio_notifier_sample.h
+index 321530d..a1e8cb6 100644
+--- a/apps/examples/radio/radio_notifier_sample.h
++++ b/apps/examples/radio/radio_notifier_sample.h
+@@ -47,14 +47,14 @@ public:
+           count_rx_late++;
+         }
+         break;
+-      case radio_event_type::UNDERFLOW:
++      case radio_event_type::UNDERRUN:
+         if (description.source == radio_event_source::TRANSMIT) {
+           count_tx_underflow++;
+         } else {
+           count_rx_underflow++;
+         }
+         break;
+-      case radio_event_type::OVERFLOW:
++      case radio_event_type::OVERRUN:
+         if (description.source == radio_event_source::TRANSMIT) {
+           count_tx_overflow++;
+         } else {
+diff --git a/include/ocudu/radio/radio_event_notifier.h b/include/ocudu/radio/radio_event_notifier.h
+index 686addf..fd95827 100644
+--- a/include/ocudu/radio/radio_event_notifier.h
++++ b/include/ocudu/radio/radio_event_notifier.h
+@@ -48,9 +48,9 @@ enum class radio_event_type {
+   /// The transmit data arrives late to the baseband unit.
+   LATE,
+   /// The transmit data is not generated fast enough.
+-  UNDERFLOW,
++  UNDERRUN,
+   /// The receive buffers are not read fast enough.
+-  OVERFLOW,
++  OVERRUN,
+   /// The event cause is not listed from the above causes.
+   OTHER
+ };
+@@ -67,9 +67,9 @@ inline const char* to_string(radio_event_type value)
+       return "end-of-burst";
+     case radio_event_type::LATE:
+       return "late";
+-    case radio_event_type::UNDERFLOW:
++    case radio_event_type::UNDERRUN:
+       return "underflow";
+-    case radio_event_type::OVERFLOW:
++    case radio_event_type::OVERRUN:
+       return "overflow";
+     case radio_event_type::OTHER:
+       return "other";
+diff --git a/lib/radio/sidekiq/radio_sidekiq_rx_stream.cpp b/lib/radio/sidekiq/radio_sidekiq_rx_stream.cpp
+index 763c894..fd15513 100644
+--- a/lib/radio/sidekiq/radio_sidekiq_rx_stream.cpp
++++ b/lib/radio/sidekiq/radio_sidekiq_rx_stream.cpp
+@@ -306,7 +306,7 @@ void radio_sidekiq_rx_stream::handle_rx_overflow() const
+   radio_event_notifier::event_description event;
+   event.stream_id = card_id;
+   event.source    = radio_event_source::RECEIVE;
+-  event.type      = radio_event_type::OVERFLOW;
++  event.type      = radio_event_type::OVERRUN;
+ 
+   // Sidekiq RF block buffer is common for all receive ports.
+   event.channel_id = 0;
+diff --git a/lib/radio/uhd/radio_uhd_rx_stream.cpp b/lib/radio/uhd/radio_uhd_rx_stream.cpp
+index d637d31..f98f4de 100644
+--- a/lib/radio/uhd/radio_uhd_rx_stream.cpp
++++ b/lib/radio/uhd/radio_uhd_rx_stream.cpp
+@@ -149,7 +149,7 @@ baseband_gateway_receiver::metadata radio_uhd_rx_stream::receive(baseband_gatewa
+         event.type = radio_event_type::LATE;
+         break;
+       case uhd::rx_metadata_t::ERROR_CODE_OVERFLOW:
+-        event.type = radio_event_type::OVERFLOW;
++        event.type = radio_event_type::OVERRUN;
+         break;
+       case uhd::rx_metadata_t::ERROR_CODE_BROKEN_CHAIN:
+       case uhd::rx_metadata_t::ERROR_CODE_ALIGNMENT:
+diff --git a/lib/radio/uhd/radio_uhd_tx_stream.cpp b/lib/radio/uhd/radio_uhd_tx_stream.cpp
+index ee6668d..757392d 100644
+--- a/lib/radio/uhd/radio_uhd_tx_stream.cpp
++++ b/lib/radio/uhd/radio_uhd_tx_stream.cpp
+@@ -53,7 +53,7 @@ void radio_uhd_tx_stream::recv_async_msg()
+       break;
+     case uhd::async_metadata_t::EVENT_CODE_UNDERFLOW:
+     case uhd::async_metadata_t::EVENT_CODE_UNDERFLOW_IN_PACKET:
+-      event_description.type = radio_event_type::UNDERFLOW;
++      event_description.type = radio_event_type::UNDERRUN;
+       state_fsm.async_event_late_underflow(async_metadata.time_spec);
+       break;
+     case uhd::async_metadata_t::EVENT_CODE_SEQ_ERROR:
+diff --git a/lib/radio/zmq/radio_zmq_rx_channel.cpp b/lib/radio/zmq/radio_zmq_rx_channel.cpp
+index 29e970d..a46b3c6 100644
+--- a/lib/radio/zmq/radio_zmq_rx_channel.cpp
++++ b/lib/radio/zmq/radio_zmq_rx_channel.cpp
+@@ -180,7 +180,7 @@ void radio_zmq_rx_channel::receive_response()
+       radio_event_notifier::event_description event = {.stream_id  = stream_id,
+                                                        .channel_id = channel_id,
+                                                        .source     = radio_event_source::RECEIVE,
+-                                                       .type       = radio_event_type::OVERFLOW,
++                                                       .type       = radio_event_type::OVERRUN,
+                                                        .timestamp  = std::nullopt};
+       notification_handler.on_radio_rt_event(event);
+ 
+diff --git a/lib/radio/zmq/radio_zmq_tx_channel.cpp b/lib/radio/zmq/radio_zmq_tx_channel.cpp
+index 0a5364f..72ada61 100644
+--- a/lib/radio/zmq/radio_zmq_tx_channel.cpp
++++ b/lib/radio/zmq/radio_zmq_tx_channel.cpp
+@@ -229,7 +229,7 @@ void radio_zmq_tx_channel::transmit_samples(span<const cf_t> data)
+       radio_event_notifier::event_description event = {.stream_id  = stream_id,
+                                                        .channel_id = channel_id,
+                                                        .source     = radio_event_source::TRANSMIT,
+-                                                       .type       = radio_event_type::OVERFLOW,
++                                                       .type       = radio_event_type::OVERRUN,
+                                                        .timestamp  = std::nullopt};
+       notification_handler.on_radio_rt_event(event);
+ 
+diff --git a/lib/ru/sdr/ru_radio_event_handler.h b/lib/ru/sdr/ru_radio_event_handler.h
+index f745d65..82c8dde 100644
+--- a/lib/ru/sdr/ru_radio_event_handler.h
++++ b/lib/ru/sdr/ru_radio_event_handler.h
+@@ -18,8 +18,8 @@ public:
+   // See interface for documentation.
+   void on_radio_rt_event(const event_description& description) override
+   {
+-    if (description.type == radio_event_type::LATE || description.type == radio_event_type::UNDERFLOW ||
+-        description.type == radio_event_type::OVERFLOW) {
++    if (description.type == radio_event_type::LATE || description.type == radio_event_type::UNDERRUN ||
++        description.type == radio_event_type::OVERRUN) {
+       logger.warning("Real-time failure in RF: {}", to_string(description.type));
+     }
+ 
+diff --git a/lib/ru/sdr/ru_radio_metrics_collector.cpp b/lib/ru/sdr/ru_radio_metrics_collector.cpp
+index 5fd463f..6a5b8ec 100644
+--- a/lib/ru/sdr/ru_radio_metrics_collector.cpp
++++ b/lib/ru/sdr/ru_radio_metrics_collector.cpp
+@@ -13,10 +13,10 @@ void ru_radio_metrics_collector::on_radio_rt_event(const event_description& desc
+     case radio_event_type::LATE:
+       late_count.fetch_add(1, std::memory_order_relaxed);
+       break;
+-    case radio_event_type::UNDERFLOW:
++    case radio_event_type::UNDERRUN:
+       underflow_count.fetch_add(1, std::memory_order_relaxed);
+       break;
+-    case radio_event_type::OVERFLOW:
++    case radio_event_type::OVERRUN:
+       overflow_count.fetch_add(1, std::memory_order_relaxed);
+       break;
+     case radio_event_type::UNDEFINED:
+diff --git a/utils/trx_ocudu/trx_ocudu.cpp b/utils/trx_ocudu/trx_ocudu.cpp
+index a6ef9f5..1797ef5 100644
+--- a/utils/trx_ocudu/trx_ocudu.cpp
++++ b/utils/trx_ocudu/trx_ocudu.cpp
+@@ -33,13 +33,13 @@ public:
+   void on_radio_rt_event(const event_description& description) override
+   {
+     if ((description.source == radio_event_source::TRANSMIT) &&
+-        ((description.type == radio_event_type::UNDERFLOW) || (description.type == radio_event_type::LATE))) {
++        ((description.type == radio_event_type::UNDERRUN) || (description.type == radio_event_type::LATE))) {
+       fmt::println("Underflow!");
+       ++tx_underflow_count;
+       return;
+     }
+ 
+-    if (description.source == radio_event_source::RECEIVE && description.type == radio_event_type::OVERFLOW) {
++    if (description.source == radio_event_source::RECEIVE && description.type == radio_event_type::OVERRUN) {
+       ++rx_overflow_count;
+       return;
+     }
+-- 
+2.55.0
+

@@ -1,0 +1,765 @@
+From 5365eb35dcb9dcc77cfe64f5d79518d9000f8d49 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:40:05 +0300
+Subject: [PATCH] support: add a kqueue io_broker backend for Darwin
+
+The io_broker has one implementation, io_broker_epoll, built on epoll
+and eventfd. Both are Linux-only, and every application and most gateway
+tests create their broker through create_io_broker(io_broker_type::epoll),
+so nothing in the tree could run on Darwin.
+
+Add io_broker_kqueue with the same structure and the same public
+behaviour. Every registered descriptor is an EVFILT_READ knote armed
+with EV_ADD | EV_ENABLE | EV_DISPATCH, the kqueue equivalent of
+EPOLLONESHOT: the knote is disabled once an event is delivered and
+re-enabled with EV_ENABLE after the receive callback has run, so one
+callback is in flight per descriptor. EV_EOF with no data left maps to
+error_code::hang_up, EV_EOF with a socket error in fflags and EV_ERROR
+map to error_code::error, and EV_EOF with data still readable is
+delivered as data first, as EPOLLIN | EPOLLRDHUP is. The control channel
+is a self-pipe instead of eventfd: enqueue_event() writes one byte to
+the write end, the read end is registered like any other descriptor and
+the handler drains it before popping the control queue. Registration,
+deregistration (including from inside a callback), pending removals and
+shutdown follow the epoll implementation line by line.
+
+io_broker_type gains a kqueue value. On Darwin the factory serves both
+epoll and kqueue requests with the new backend, so callers keep one
+spelling; on Linux a kqueue request still terminates as unsupported.
+lib/support compiles exactly one backend per platform.
+---
+ include/ocudu/support/io/io_broker_factory.h |   6 +-
+ lib/support/CMakeLists.txt                   |   8 +-
+ lib/support/network/io_broker_factory.cpp    |  11 +
+ lib/support/network/io_broker_kqueue.cpp     | 517 +++++++++++++++++++
+ lib/support/network/io_broker_kqueue.h       | 120 +++++
+ 5 files changed, 660 insertions(+), 2 deletions(-)
+ create mode 100644 lib/support/network/io_broker_kqueue.cpp
+ create mode 100644 lib/support/network/io_broker_kqueue.h
+
+diff --git a/include/ocudu/support/io/io_broker_factory.h b/include/ocudu/support/io/io_broker_factory.h
+index f3d26b2..f5715d3 100644
+--- a/include/ocudu/support/io/io_broker_factory.h
++++ b/include/ocudu/support/io/io_broker_factory.h
+@@ -8,7 +8,11 @@
+ 
+ namespace ocudu {
+ 
+-enum class io_broker_type { epoll, io_uring };
++/// \brief Available IO broker backends.
++///
++/// epoll is the Linux backend. kqueue is the Darwin/BSD backend; on those systems a request for epoll is served by
++/// kqueue, so callers keep one spelling.
++enum class io_broker_type { epoll, io_uring, kqueue };
+ 
+ /// Creates an instance of an IO broker
+ std::unique_ptr<io_broker> create_io_broker(io_broker_type type, const io_broker_config& config = io_broker_config());
+diff --git a/lib/support/CMakeLists.txt b/lib/support/CMakeLists.txt
+index 197a010..0735056 100644
+--- a/lib/support/CMakeLists.txt
++++ b/lib/support/CMakeLists.txt
+@@ -19,7 +19,6 @@ set(SOURCES
+         executors/unique_thread.cpp
+         executors/execution_context_description.cpp
+         executors/executor_decoration_factory.cpp
+-        network/io_broker_epoll.cpp
+         network/io_broker_factory.cpp
+         network/io_timer_source.cpp
+         network/timerfd_compat.cpp
+@@ -46,6 +45,13 @@ set(SOURCES
+         timers.cpp
+ )
+ 
++# IO broker backend: epoll on Linux, kqueue on Darwin.
++if (APPLE)
++    list(APPEND SOURCES network/io_broker_kqueue.cpp)
++else ()
++    list(APPEND SOURCES network/io_broker_epoll.cpp)
++endif ()
++
+ add_library(ocudu_support STATIC ${SOURCES})
+ target_link_libraries(ocudu_support
+         PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${NUMA_LIBRARIES} ocudulog
+diff --git a/lib/support/network/io_broker_factory.cpp b/lib/support/network/io_broker_factory.cpp
+index ee4152e..8740749 100644
+--- a/lib/support/network/io_broker_factory.cpp
++++ b/lib/support/network/io_broker_factory.cpp
+@@ -2,15 +2,26 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "ocudu/support/io/io_broker_factory.h"
++#ifdef __APPLE__
++#include "io_broker_kqueue.h"
++#else
+ #include "io_broker_epoll.h"
++#endif
+ 
+ using namespace ocudu;
+ 
+ std::unique_ptr<io_broker> ocudu::create_io_broker(io_broker_type type, const io_broker_config& config)
+ {
+   switch (type) {
++#ifdef __APPLE__
++    // Darwin has no epoll. The epoll request every application makes is served by the kqueue backend.
++    case io_broker_type::epoll:
++    case io_broker_type::kqueue:
++      return std::make_unique<io_broker_kqueue>(config);
++#else
+     case io_broker_type::epoll:
+       return std::make_unique<io_broker_epoll>(config);
++#endif
+     default:
+       ocudu_terminate("IO broker type not supported");
+   }
+diff --git a/lib/support/network/io_broker_kqueue.cpp b/lib/support/network/io_broker_kqueue.cpp
+new file mode 100644
+index 0000000..ec2ec7c
+--- /dev/null
++++ b/lib/support/network/io_broker_kqueue.cpp
+@@ -0,0 +1,517 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#include "io_broker_kqueue.h"
++#include "ocudu/ocudulog/ocudulog.h"
++#include "ocudu/support/error_handling.h"
++#include <algorithm>
++#include <fcntl.h>
++#include <sys/event.h>
++#include <unistd.h>
++
++using namespace ocudu;
++
++// TODO: parameterize
++static constexpr unsigned event_queue_size = 32;
++
++/// Tracks the FD that is currently being read in the receive callback.
++thread_local int fd_read_in_callback = -1;
++
++/// Sentinel value used by \c fd_read_in_callback to signal that the FD should not be rearmed.
++static constexpr int AVOID_FD_REARMING = -2;
++
++io_broker_kqueue::io_broker_kqueue(const io_broker_config& config) :
++  logger(ocudulog::fetch_basic_logger("IO-KQUEUE")), event_queue(event_queue_size)
++{
++  pending_fds_to_remove.reserve(16);
++
++  // Init kqueue.
++  kqueue_fd = unique_fd{::kqueue()};
++  if (not kqueue_fd.is_open()) {
++    report_fatal_error("IO broker: failed to create kqueue file descriptor. error={}", ::strerror(errno));
++  }
++
++  // Self-pipe used to wake the loop for stops, fd registrations and fd deregistrations.
++  int pipe_fds[2];
++  if (::pipe(pipe_fds) != 0) {
++    report_fatal_error("IO broker: failed to create control pipe. error={}", ::strerror(errno));
++  }
++  for (int pfd : pipe_fds) {
++    ::fcntl(pfd, F_SETFL, ::fcntl(pfd, F_GETFL, 0) | O_NONBLOCK);
++    ::fcntl(pfd, F_SETFD, FD_CLOEXEC);
++  }
++  int on = 1;
++  ::fcntl(pipe_fds[1], F_SETNOSIGPIPE, on);
++  auto ctrl_event_fd = unique_fd{pipe_fds[0]};
++  ctrl_wakeup_fd     = unique_fd{pipe_fds[1]};
++
++  auto data_handler  = [this]() { handle_enqueued_events(); };
++  auto error_handler = [this](error_code code) {
++    logger.error("Error on control event file descriptor. Error code: {}", (int)code);
++  };
++  ctrl_event_raw_fd = ctrl_event_fd.value();
++  if (not handle_fd_registration(std::move(ctrl_event_fd), data_handler, error_handler, nullptr, nullptr)) {
++    report_fatal_error("IO broker: failed to register control event file descriptor. ctrl_event_fd={}",
++                       ctrl_event_raw_fd);
++  }
++
++  // start thread to handle kqueue events.
++  std::promise<void> p;
++  std::future<void>  fut = p.get_future();
++  thread                 = unique_thread(config.thread_name, config.thread_prio, [this, &p]() {
++    running = true;
++    p.set_value();
++    thread_loop();
++  });
++
++  // Wait for the thread to start before returning.
++  fut.wait();
++}
++
++io_broker_kqueue::~io_broker_kqueue()
++{
++  // Wait for completion.
++  if (thread.running()) {
++    enqueue_event(control_event{control_event::event_type::close_io_broker, {}, -1, nullptr, {}, {}, nullptr});
++    thread.join();
++  }
++
++  stop_impl();
++
++  if (not ctrl_wakeup_fd.close()) {
++    logger.error("Failed to close io broker control pipe: {}", ::strerror(errno));
++  }
++  if (not kqueue_fd.close()) {
++    logger.error("Failed to close io kqueue broker file descriptor: {}", ::strerror(errno));
++  }
++
++  logger.info("Closed io_broker");
++}
++
++bool io_broker_kqueue::kqueue_add(int fd)
++{
++  // EV_DISPATCH disables the knote once an event has been delivered, until rearm_fd() enables it again. This is the
++  // equivalent of EPOLLONESHOT and keeps one callback in flight per descriptor.
++  struct kevent ev;
++  EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_READ, EV_ADD | EV_ENABLE | EV_DISPATCH, 0, 0, nullptr);
++  return ::kevent(kqueue_fd.value(), &ev, 1, nullptr, 0, nullptr) == 0;
++}
++
++bool io_broker_kqueue::kqueue_delete(int fd)
++{
++  struct kevent ev;
++  EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
++  return ::kevent(kqueue_fd.value(), &ev, 1, nullptr, 0, nullptr) == 0;
++}
++
++void io_broker_kqueue::rearm_fd(int fd)
++{
++  struct kevent ev;
++  EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_READ, EV_ENABLE | EV_DISPATCH, 0, 0, nullptr);
++  if (::kevent(kqueue_fd.value(), &ev, 1, nullptr, 0, nullptr) != 0) {
++    logger.error("Failed to rearm file descriptor: {}", fd);
++  }
++}
++
++// Function is executed in a loop until the destructor is called.
++void io_broker_kqueue::thread_loop()
++{
++  logger.debug("io_broker thread started...");
++
++  while (true) {
++    // Process any pending file descriptor removals.
++    for (auto it = pending_fds_to_remove.begin(); it != pending_fds_to_remove.end();) {
++      if (auto event_it = event_handler.find(it->first); event_it != event_handler.end()) {
++        if (event_it->second.job_count.load(std::memory_order_acquire) == 0) {
++          handle_fd_kqueue_removal(it->first, true, std::nullopt, it->second);
++          it = pending_fds_to_remove.erase(it);
++          continue;
++        }
++      }
++      ++it;
++    }
++
++    // wait for event
++    constexpr unsigned MAX_EVENTS = 8;
++    struct kevent      events[MAX_EVENTS];
++    int                nof_events = ::kevent(kqueue_fd.value(), nullptr, 0, events, MAX_EVENTS, nullptr);
++
++    // handle event
++    if (nof_events == -1) {
++      // Note: "Interrupted system call" can happen while debugging.
++      if (errno != EINTR) {
++        logger.error("kevent(): {}", ::strerror(errno));
++      }
++      continue;
++    }
++    if (nof_events == 0) {
++      logger.error("kevent() returned without events");
++      continue;
++    }
++
++    for (int i = 0; i < nof_events; ++i) {
++      const int      fd    = static_cast<int>(events[i].ident);
++      const uint16_t flags = events[i].flags;
++
++      // EVFILT_READ reports EV_EOF when the peer has closed; data holds the bytes still readable. As with
++      // EPOLLIN | EPOLLRDHUP, drain the data first and report the hang up once nothing is left.
++      const bool has_error   = (flags & EV_ERROR) != 0;
++      const bool has_data    = events[i].data > 0;
++      const bool hung_up     = (flags & EV_EOF) != 0 and not has_data;
++      const bool is_readable = not has_error and (has_data or (flags & EV_EOF) == 0);
++
++      if (not is_readable or hung_up) {
++        // There is no data to receive, process errors and hangups now.
++        error_code code = io_broker::error_code::other;
++        if (has_error) {
++          logger.error("fd={}: Error on file descriptor. error={}", fd, ::strerror(static_cast<int>(events[i].data)));
++          code = io_broker::error_code::error;
++        } else if (hung_up) {
++          if (events[i].fflags != 0) {
++            logger.error("fd={}: Error on file descriptor. error={}", fd, ::strerror(static_cast<int>(events[i].fflags)));
++            code = io_broker::error_code::error;
++          } else {
++            // Note: some container environments hang up stdin (fd=0) in case of non-interactive sessions
++            logger.warning("fd={}: Hang up on file descriptor. Flags: {:#x}", fd, flags);
++            code = io_broker::error_code::hang_up;
++          }
++        } else {
++          logger.error("fd={}: Unhandled kqueue event. Flags={:#x}", fd, flags);
++        }
++
++        // Deregister the faulty file descriptor from the kqueue.
++        handle_fd_kqueue_removal(fd, false, code, nullptr);
++        continue;
++      }
++
++      const auto it = event_handler.find(fd);
++      if (it == event_handler.end() or not it->second.registered_in_kqueue()) {
++        logger.info("fd={}: Ignoring event. Cause: File descriptor handler not found", fd);
++        continue;
++      }
++
++      if (fd == ctrl_event_raw_fd) {
++        it->second.read_callback();
++        // No rearming needed when the stop command has been executed by the callback.
++        if (running.load(std::memory_order_relaxed)) {
++          rearm_fd(fd);
++        } else {
++          logger.debug("io_broker thread stopped");
++          return;
++        }
++        continue;
++      }
++
++      // Avoid enqueuing the callback if this FD is enqueued for deletion. It will be removed in the next loop
++      // iteration.
++      if (auto pending_it = std::find_if(pending_fds_to_remove.begin(),
++                                         pending_fds_to_remove.end(),
++                                         [fd](const auto& elem) { return fd == elem.first; });
++          pending_it != pending_fds_to_remove.end()) {
++        continue;
++      }
++
++      // Make sure that the socket was not re-armed while the callback is still running.
++      bool in_callback = false;
++      it->second.is_executing_recv_callback.compare_exchange_strong(
++          in_callback, true, std::memory_order_acq_rel, std::memory_order_relaxed);
++      if (in_callback) {
++        logger.error("Trying to defer callback execution, but previous callback for this socket is not finished");
++        continue;
++      }
++
++      // Increment fd_handler job count before deferring the task.
++      it->second.job_count.fetch_add(1, std::memory_order_release);
++      if (not it->second.executor->defer([this,
++                                          fd,
++                                          callback       = &it->second.read_callback,
++                                          job_count      = &it->second.job_count,
++                                          is_in_callback = &it->second.is_executing_recv_callback]() {
++            // Track the current FD that is being read by this thread.
++            fd_read_in_callback = fd;
++            (*callback)();
++            is_in_callback->store(false, std::memory_order_release);
++            // Avoid rearming this FD if the callback unregistered it.
++            if (fd_read_in_callback != AVOID_FD_REARMING) {
++              rearm_fd(fd);
++            }
++            fd_read_in_callback = -1;
++            // Decrement fd_handler job count after deferred task finished.
++            job_count->fetch_sub(1, std::memory_order_release);
++          })) {
++        rearm_fd(fd);
++        // Reset is_executing_recv_callback flag and decrement fd_handler job count after task deferring failed.
++        it->second.is_executing_recv_callback.store(false, std::memory_order_release);
++        it->second.job_count.fetch_sub(1, std::memory_order_release);
++        logger.error("Could not enqueue task for processing file descriptor: {}", fd);
++      }
++    }
++  }
++}
++
++bool io_broker_kqueue::enqueue_event(control_event&& event)
++{
++  // Push of an event
++  event_queue.push_blocking(std::move(event));
++
++  // Write one byte into the self-pipe to interrupt a blocking kevent(). A full pipe (EAGAIN) means a wake-up is
++  // already pending, which is as good as a new one.
++  const uint8_t tmp = 1;
++  ssize_t       ret = ::write(ctrl_wakeup_fd.value(), &tmp, sizeof(tmp));
++  if (ret == -1 and errno == EAGAIN) {
++    return true;
++  }
++  if (ret == -1) {
++    logger.error("Error notifying io CTRL pipe: {}", ::strerror(errno));
++  }
++  return ret >= 0;
++}
++
++void io_broker_kqueue::handle_enqueued_events()
++{
++  // Drain the self-pipe so that it stops signalling readiness. Several wake-ups may have accumulated.
++  uint8_t drain[64];
++  while (::read(ctrl_event_raw_fd, drain, sizeof(drain)) > 0) {
++  }
++
++  // Keep popping from the event queue.
++  control_event ev;
++  while (event_queue.try_pop(ev)) {
++    // Handle event dequeued.
++    switch (ev.type) {
++      case control_event::event_type::register_fd:
++        // Register new fd and event handler.
++        handle_fd_registration(std::move(ev.fd), ev.handler, ev.err_handler, ev.executor, ev.completed);
++        break;
++      case control_event::event_type::deregister_fd:
++        if (auto it = event_handler.find(ev.raw_fd); it != event_handler.end()) {
++          // It is safe to directly deregister the FD if there are no tasks reading from it.
++          if (it->second.job_count.load(std::memory_order_acquire) == 0) {
++            handle_fd_kqueue_removal(ev.raw_fd, false, std::nullopt, ev.completed);
++            break;
++          }
++          // Enqueue fd deregistration.
++          pending_fds_to_remove.emplace_back(ev.raw_fd, ev.completed);
++          break;
++        }
++        // FD may have been already deregistered.
++        ev.completed->set_value(false);
++        break;
++      case control_event::event_type::close_io_broker:
++        // Set flag to stop thread loop.
++        running.store(false, std::memory_order_release);
++        return;
++      default:
++        report_fatal_error("Unknown event type {}", (int)ev.type);
++    }
++  }
++}
++
++bool io_broker_kqueue::handle_fd_registration(unique_fd               fd,
++                                              const recv_callback_t&  handler,
++                                              const error_callback_t& err_handler,
++                                              task_executor*          executor,
++                                              std::promise<bool>*     complete_notifier)
++{
++  if (event_handler.count(fd.value()) > 0) {
++    logger.error("fd={}: Failed to register file descriptor. Cause: File descriptor already registered", fd.value());
++    if (complete_notifier != nullptr) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++
++  int raw_fd = fd.value();
++
++  // Add fd to the kqueue.
++  if (not kqueue_add(raw_fd)) {
++    logger.error(
++        "fd={}: Failed to register file descriptor. Cause: kevent failed with \"{}\"", raw_fd, ::strerror(errno));
++    if (complete_notifier != nullptr) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++
++  // Register the handler of the fd.
++  event_handler.emplace(std::piecewise_construct,
++                        std::forward_as_tuple(raw_fd),
++                        std::forward_as_tuple(executor, handler, err_handler, std::move(fd)));
++
++  if (complete_notifier != nullptr) {
++    complete_notifier->set_value(true);
++  }
++  return true;
++}
++
++bool io_broker_kqueue::handle_fd_kqueue_removal(int                       fd,
++                                                bool                      io_broker_deregistration_required,
++                                                std::optional<error_code> kqueue_error,
++                                                std::promise<bool>*       complete_notifier)
++{
++  // The file descriptor must be already registered.
++  auto ev_it = event_handler.find(fd);
++  if (ev_it == event_handler.end()) {
++    // File descriptor not found.
++    // Note: It could have been automatically deregistered by the io broker and the subscriber could trigger the removal
++    // on its destruction.
++    logger.error("fd={}: Failed to deregister file descriptor. Cause: File descriptor not found", fd);
++    if (complete_notifier != nullptr) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++
++  // In case the cause for the FD removal was a kqueue error, forward the error to the event handler.
++  // Note: We avoid calling the error handling callback in case the FD removal was due to the subscriber
++  // close/destruction or due to the io_broker being destroyed.
++  if (kqueue_error.has_value()) {
++    ev_it->second.error_callback(*kqueue_error);
++  }
++
++  // Remove FD from the kqueue.
++  if (not kqueue_delete(fd)) {
++    logger.error(
++        "fd={}: Failed to deregister file descriptor. Cause: kevent failed with \"{}\"", fd, ::strerror(errno));
++    event_handler.erase(ev_it);
++    if (complete_notifier != nullptr) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++
++  logger.debug("fd={}: File descriptor deregistered from kqueue interest list", fd);
++  event_handler.erase(ev_it);
++
++  // Notify completion of asynchronous task.
++  if (complete_notifier != nullptr) {
++    complete_notifier->set_value(true);
++  }
++  return true;
++}
++
++/// Adds a new file descriptor to the kqueue. The call is thread-safe and new
++/// file descriptors can be added while kevent() is blocking.
++io_broker::subscriber io_broker_kqueue::register_fd(unique_fd        fd,
++                                                    task_executor&   executor,
++                                                    recv_callback_t  handler,
++                                                    error_callback_t err_handler)
++{
++  if (not fd.is_open()) {
++    logger.error("File descriptor registration failed. Cause: Invalid file descriptor value");
++    return subscriber{};
++  }
++
++  if (not running.load(std::memory_order_acquire)) {
++    logger.warning("fd={}: Registration failed. Cause: io_broker is not running", fd.value());
++    return subscriber{};
++  }
++
++  int raw_fd = fd.value();
++
++  if (std::this_thread::get_id() == thread.get_id()) {
++    // Registration from within the kqueue thread.
++    if (handle_fd_registration(std::move(fd), handler, err_handler, &executor, nullptr)) {
++      return subscriber{*this, raw_fd};
++    }
++    return subscriber{};
++  }
++
++  report_error_if_not(fd_read_in_callback < 0, "Cannot register a new file descriptor inside the read callback");
++
++  std::promise<bool> p;
++  std::future<bool>  fut = p.get_future();
++
++  enqueue_event(control_event{
++      control_event::event_type::register_fd, std::move(fd), raw_fd, &executor, handler, err_handler, &p});
++
++  // Wait for the registration to complete.
++  if (fut.get()) {
++    logger.info("fd={}: Registered file descriptor successfully", raw_fd);
++    return subscriber{*this, raw_fd};
++  }
++  return subscriber{};
++}
++
++/// \brief Remove fd from the kqueue.
++bool io_broker_kqueue::unregister_fd(int fd, std::promise<bool>* complete_notifier)
++{
++  if (fd < 0) {
++    logger.error("fd={}: File descriptor deregistration failed. Cause: Invalid file descriptor value", fd);
++    if (complete_notifier) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++  if (not running.load(std::memory_order_acquire)) {
++    logger.warning("fd={}: Deregistration failed. Cause: io_broker is not running", fd);
++    if (complete_notifier) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++  logger.debug("fd={}: Deregistering file descriptor...", fd);
++
++  report_error_if_not(not(fd_read_in_callback >= 0 and fd_read_in_callback != fd),
++                      "Cannot deregister an unrelated file descriptor inside the read callback");
++
++  // Handle the case of calling unregister from the read callback.
++  if (fd_read_in_callback == fd) {
++    // No rearming is needed as the FD is going to be being removed and no more callbacks should be called for it.
++    fd_read_in_callback = AVOID_FD_REARMING;
++    if (complete_notifier) {
++      complete_notifier->set_value(true);
++      complete_notifier = nullptr;
++    }
++  }
++
++  if (not enqueue_event(
++          control_event{control_event::event_type::deregister_fd, {}, fd, nullptr, {}, {}, complete_notifier})) {
++    if (complete_notifier) {
++      complete_notifier->set_value(false);
++    }
++    return false;
++  }
++
++  return true;
++}
++
++void io_broker_kqueue::stop_impl()
++{
++  // Process any pending file descriptor removals.
++  for (auto it = pending_fds_to_remove.begin(); it != pending_fds_to_remove.end();) {
++    if (auto event_it = event_handler.find(it->first); event_it != event_handler.end()) {
++      while (event_it->second.job_count.load(std::memory_order_acquire) != 0) {
++        // Postpone file descriptor removal until all tasks using it finish.
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++      }
++      handle_fd_kqueue_removal(it->first, true, std::nullopt, it->second);
++      it = pending_fds_to_remove.erase(it);
++      continue;
++    }
++    ++it;
++  }
++
++  // Check if there are any alive file descriptors apart from the control event file descriptor.
++  if (event_handler.size() > 1) {
++    logger.warning("File descriptors are still registered during io broker shutdown.");
++  }
++
++  // Deregistering all existing file descriptors.
++  for (auto it = event_handler.begin(); it != event_handler.end();) {
++    while (it->second.job_count.load(std::memory_order_acquire) != 0) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    if (not kqueue_delete(it->first)) {
++      logger.error("fd={}: Failed to deregister file descriptor. Cause: kevent failed with \"{}\"",
++                   it->first,
++                   ::strerror(errno));
++    }
++    it = event_handler.erase(it);
++  }
++
++  // Clear event queue.
++  event_queue.clear();
++  // Clear event handler map.
++  event_handler.clear();
++}
+diff --git a/lib/support/network/io_broker_kqueue.h b/lib/support/network/io_broker_kqueue.h
+new file mode 100644
+index 0000000..1f076a3
+--- /dev/null
++++ b/lib/support/network/io_broker_kqueue.h
+@@ -0,0 +1,120 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++#include "ocudu/adt/blocking_queue.h"
++#include "ocudu/support/io/io_broker.h"
++#include "ocudu/support/io/unique_fd.h"
++#include <future>
++#include <optional>
++#include <unordered_map>
++#include <utility>
++
++namespace ocudu {
++class task_executor;
++
++/// \brief Implementation of an IO broker using kqueue (Darwin, BSD).
++///
++/// Mirrors io_broker_epoll: every registered descriptor is an EVFILT_READ knote armed with EV_DISPATCH, which is the
++/// kqueue equivalent of EPOLLONESHOT; the knote is re-enabled once the receive callback has run. Control requests
++/// (register, deregister, stop) are queued and the loop is woken through a self-pipe registered like any other
++/// descriptor, since Darwin has no eventfd.
++class io_broker_kqueue final : public io_broker
++{
++public:
++  explicit io_broker_kqueue(const io_broker_config& config);
++  ~io_broker_kqueue() override;
++
++  [[nodiscard]] subscriber
++  register_fd(unique_fd fd, task_executor& executor, recv_callback_t handler, error_callback_t err_handler) override;
++
++private:
++  /// Event enqueued to be handled in the io_broker thread.
++  struct control_event {
++    enum class event_type { close_io_broker, register_fd, deregister_fd } type;
++    unique_fd           fd;
++    int                 raw_fd;
++    task_executor*      executor = nullptr;
++    recv_callback_t     handler;
++    error_callback_t    err_handler;
++    std::promise<bool>* completed = nullptr;
++  };
++
++  /// Event handler for a file descriptor.
++  struct fd_handler {
++    fd_handler(task_executor*   executor_,
++               recv_callback_t  read_callback_,
++               error_callback_t error_callback_,
++               unique_fd        fd_) :
++      executor(executor_),
++      read_callback(std::move(read_callback_)),
++      error_callback(std::move(error_callback_)),
++      fd(std::move(fd_))
++    {
++    }
++
++    task_executor*        executor;
++    recv_callback_t       read_callback;
++    error_callback_t      error_callback;
++    std::atomic<unsigned> job_count                  = 0;
++    std::atomic<bool>     is_executing_recv_callback = false;
++    unique_fd             fd;
++
++    // Determines whether the io_broker has deregistered the event handler from the kqueue.
++    bool registered_in_kqueue() const { return static_cast<bool>(read_callback); }
++  };
++
++  [[nodiscard]] bool unregister_fd(int fd, std::promise<bool>* complete_notifier) override;
++
++  void thread_loop();
++
++  // Enqueues event to be asynchronously processed by the kqueue thread.
++  bool enqueue_event(control_event&& event);
++
++  // Handle events stored in the ctrl event queue.
++  void handle_enqueued_events();
++
++  // Handle the registration of a new file descriptor.
++  bool handle_fd_registration(unique_fd               fd,
++                              const recv_callback_t&  callback,
++                              const error_callback_t& err_handler,
++                              task_executor*          executor,
++                              std::promise<bool>*     complete_notifier);
++
++  // Handle the deregistration of an existing file descriptor.
++  bool handle_fd_kqueue_removal(int                       fd,
++                                bool                      io_broker_deregistration_required,
++                                std::optional<error_code> kqueue_error,
++                                std::promise<bool>*       complete_notifier);
++
++  void stop_impl();
++
++  // kqueue knote helpers.
++  bool kqueue_add(int fd);
++  bool kqueue_delete(int fd);
++  void rearm_fd(int fd);
++
++  ocudulog::basic_logger& logger;
++
++  // Main kqueue file descriptor.
++  unique_fd kqueue_fd;
++  // Self-pipe used to interrupt kevent() when a stop, fd registration, or fd deregistration is requested. The read end
++  // is registered in the kqueue and owned by its fd_handler; the write end is owned here.
++  int       ctrl_event_raw_fd = -1;
++  unique_fd ctrl_wakeup_fd;
++
++  // Lookup table mapping file descriptors to handlers.
++  std::unordered_map<int, fd_handler> event_handler;
++
++  // Queue used to communicate commands to the kqueue broker.
++  blocking_queue<control_event> event_queue;
++
++  std::atomic<bool> running{true};
++  unique_thread     thread;
++
++  // File descriptors pending to be removed.
++  std::vector<std::pair<int, std::promise<bool>*>> pending_fds_to_remove;
++};
++
++} // namespace ocudu
+-- 
+2.55.0
+

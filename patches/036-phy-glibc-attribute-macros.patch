@@ -1,0 +1,146 @@
+From 5ad675f8f3af6488891189d0c06fe44f4f74da2b Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] phy: use the compiler attribute syntax, not glibc's
+ __always_inline and __attribute_noinline__
+
+__always_inline and __attribute_noinline__ are convenience macros from
+glibc's <sys/cdefs.h>. Darwin's libc does not define them, so the LDPC
+decoders and the channel estimator fail with "unknown type name". Spell
+the attributes out: inline __attribute__((always_inline)) and
+__attribute__((noinline)), which GCC and clang accept everywhere and
+which is exactly what the glibc macros expand to.
+---
+ .../channel_coding/ldpc/ldpc_decoder_avx2.cpp      |  8 ++++----
+ .../channel_coding/ldpc/ldpc_decoder_avx512.cpp    | 14 +++++++-------
+ .../channel_coding/ldpc/ldpc_decoder_neon.cpp      |  8 ++++----
+ .../port_channel_estimator_average_impl.cpp        |  2 +-
+ 4 files changed, 16 insertions(+), 16 deletions(-)
+
+diff --git a/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx2.cpp b/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx2.cpp
+index 68cb629..0f41752 100644
+--- a/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx2.cpp
++++ b/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx2.cpp
+@@ -16,22 +16,22 @@ using namespace ocudu;
+ using namespace ocudu::ldpc;
+ 
+ // AVX2 vectors filled with useful constants.
+-static __always_inline __m256i LLR_MAX_epi8()
++static inline __attribute__((always_inline)) __m256i LLR_MAX_epi8()
+ {
+   return _mm256_set1_epi8(LLR_MAX.to_value_type());
+ }
+ 
+-static __always_inline __m256i LLR_MIN_epi8()
++static inline __attribute__((always_inline)) __m256i LLR_MIN_epi8()
+ {
+   return _mm256_set1_epi8(LLR_MIN.to_value_type());
+ }
+ 
+-static __always_inline __m256i LLR_INFINITY_epi8()
++static inline __attribute__((always_inline)) __m256i LLR_INFINITY_epi8()
+ {
+   return _mm256_set1_epi8(LLR_INFINITY.to_value_type());
+ }
+ 
+-static __always_inline __m256i LLR_NEG_INFINITY_epi8()
++static inline __attribute__((always_inline)) __m256i LLR_NEG_INFINITY_epi8()
+ {
+   return _mm256_set1_epi8(-LLR_INFINITY.to_value_type());
+ }
+diff --git a/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx512.cpp b/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx512.cpp
+index cf3a875..10db7ca 100644
+--- a/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx512.cpp
++++ b/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_avx512.cpp
+@@ -15,37 +15,37 @@ using namespace ocudu;
+ using namespace ocudu::ldpc;
+ 
+ // AVX512 vectors filled with useful constants.
+-static __always_inline __m512i LLR_MAX_epi8()
++static inline __attribute__((always_inline)) __m512i LLR_MAX_epi8()
+ {
+   return _mm512_set1_epi8(LLR_MAX.to_value_type());
+ }
+ 
+-static __always_inline __m512i LLR_MIN_epi8()
++static inline __attribute__((always_inline)) __m512i LLR_MIN_epi8()
+ {
+   return _mm512_set1_epi8(LLR_MIN.to_value_type());
+ }
+ 
+-static __always_inline __m512i LLR_INFINITY_epi8()
++static inline __attribute__((always_inline)) __m512i LLR_INFINITY_epi8()
+ {
+   return _mm512_set1_epi8(LLR_INFINITY.to_value_type());
+ }
+ 
+-static __always_inline __m512i LLR_NEG_INFINITY_epi8()
++static inline __attribute__((always_inline)) __m512i LLR_NEG_INFINITY_epi8()
+ {
+   return _mm512_set1_epi8(-LLR_INFINITY.to_value_type());
+ }
+ 
+-static __always_inline __m512i ONE_epi8()
++static inline __attribute__((always_inline)) __m512i ONE_epi8()
+ {
+   return _mm512_set1_epi8(1);
+ }
+ 
+-static __always_inline __m512i FF_epi8()
++static inline __attribute__((always_inline)) __m512i FF_epi8()
+ {
+   return _mm512_set1_epi8(0xff);
+ }
+ 
+-static __always_inline __m512i ZERO_epi8()
++static inline __attribute__((always_inline)) __m512i ZERO_epi8()
+ {
+   return _mm512_setzero_si512();
+ }
+diff --git a/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_neon.cpp b/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_neon.cpp
+index 9387bf4..41457f8 100644
+--- a/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_neon.cpp
++++ b/lib/phy/upper/channel_coding/ldpc/ldpc_decoder_neon.cpp
+@@ -15,22 +15,22 @@ using namespace ocudu;
+ using namespace ocudu::ldpc;
+ 
+ // NEON vectors filled with useful constants.
+-static __always_inline int8x16_t LLR_MAX_s8()
++static inline __attribute__((always_inline)) int8x16_t LLR_MAX_s8()
+ {
+   return vdupq_n_s8(LLR_MAX.to_value_type());
+ }
+ 
+-static __always_inline int8x16_t LLR_MIN_s8()
++static inline __attribute__((always_inline)) int8x16_t LLR_MIN_s8()
+ {
+   return vdupq_n_s8(LLR_MIN.to_value_type());
+ }
+ 
+-static __always_inline int8x16_t LLR_INFINITY_s8()
++static inline __attribute__((always_inline)) int8x16_t LLR_INFINITY_s8()
+ {
+   return vdupq_n_s8(LLR_INFINITY.to_value_type());
+ }
+ 
+-static __always_inline int8x16_t LLR_NEG_INFINITY_s8()
++static inline __attribute__((always_inline)) int8x16_t LLR_NEG_INFINITY_s8()
+ {
+   return vdupq_n_s8(-LLR_INFINITY.to_value_type());
+ }
+diff --git a/lib/phy/upper/signal_processors/channel_estimator/port_channel_estimator_average_impl.cpp b/lib/phy/upper/signal_processors/channel_estimator/port_channel_estimator_average_impl.cpp
+index f4afb1f..f07635f 100644
+--- a/lib/phy/upper/signal_processors/channel_estimator/port_channel_estimator_average_impl.cpp
++++ b/lib/phy/upper/signal_processors/channel_estimator/port_channel_estimator_average_impl.cpp
+@@ -862,7 +862,7 @@ static float estimate_noise(const dmrs_symbol_list&                   pilots,
+   return std::isnormal(noise_energy) ? noise_energy : 0;
+ }
+ 
+-__attribute_noinline__ static void
++__attribute__((noinline)) static void
+ simd_vector_interpolate(span<cbf16_t> out, span<const cf_t> first, span<const cf_t> second, float weight)
+ {
+   unsigned size = out.size();
+-- 
+2.55.0
+

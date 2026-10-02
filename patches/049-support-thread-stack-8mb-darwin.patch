@@ -1,0 +1,217 @@
+From d6c91bd932055902b12dd60cb3a8a422964ad201 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 16:23:02 +0300
+Subject: [PATCH] support: give unique_thread an 8 MB stack on Darwin
+
+Linux threads get the RLIMIT_STACK default of 8 MB. Darwin gives
+secondary threads 512 kB, and the FAPI messages the MAC and PHY
+adaptors keep on the stack add up to more than that along the call
+chain (a dl_tti_request is 74 kB, an ul_tti_request 34 kB, several per
+slot): on the first slot after cell creation the gNB died with SIGBUS in
+the stack probe (___chkstk_darwin) of
+fapi_to_phy_fastpath_translator::send_dl_tti_request on a main_pool
+worker.
+
+Introduce detail::os_thread, the subset of std::thread that unique_thread
+uses (join, joinable, get_id). On Darwin it creates the thread with
+pthread_create and an explicit 8 MB stack and learns its std::thread::id
+from the new thread itself, so callers that compare against
+std::this_thread::get_id() keep working. On Linux it is std::thread, so
+nothing changes there.
+---
+ .../ocudu/support/executors/unique_thread.h   | 71 +++++++++++++++++--
+ lib/support/executors/unique_thread.cpp       | 65 +++++++++++++++--
+ 2 files changed, 126 insertions(+), 10 deletions(-)
+
+diff --git a/include/ocudu/support/executors/unique_thread.h b/include/ocudu/support/executors/unique_thread.h
+index da9b793..ec0e2d4 100644
+--- a/include/ocudu/support/executors/unique_thread.h
++++ b/include/ocudu/support/executors/unique_thread.h
+@@ -8,8 +8,10 @@
+ #include "ocudu/adt/unique_function.h"
+ #include "ocudu/support/cpu_architecture_info.h"
+ #include "ocudu/support/executors/thread_utils.h"
++#include <pthread.h>
+ #include <string>
+ #include <thread>
++#include <utility>
+ 
+ namespace ocudu {
+ 
+@@ -147,6 +149,65 @@ private:
+   bounded_bitset<MAX_CPUS> cpu_bitset;
+ };
+ 
++namespace detail {
++
++#ifdef __APPLE__
++
++/// \brief Thread with an explicit stack size, the subset of std::thread that unique_thread uses.
++///
++/// Linux gives every thread the RLIMIT_STACK default of 8 MB. Darwin gives secondary threads 512 kB, and the FAPI
++/// messages the MAC and PHY adaptors keep on the stack (a dl_tti_request is 74 kB, an ul_tti_request 34 kB, several per
++/// slot across the call chain) overflow it: the gNB died with SIGBUS in the stack probe of send_dl_tti_request() on the
++/// first slot. Threads created here get the Linux default so the same code runs on both.
++class os_thread
++{
++public:
++  static constexpr size_t stack_size = size_t{8} << 20;
++
++  os_thread() = default;
++  explicit os_thread(unique_function<void()> callable);
++  os_thread(os_thread&& other) noexcept :
++    handle(other.handle), id(other.id), active(std::exchange(other.active, false))
++  {
++  }
++  os_thread& operator=(os_thread&& other) noexcept
++  {
++    if (joinable()) {
++      std::terminate();
++    }
++    handle = other.handle;
++    id     = other.id;
++    active = std::exchange(other.active, false);
++    return *this;
++  }
++  os_thread(const os_thread&)            = delete;
++  os_thread& operator=(const os_thread&) = delete;
++  ~os_thread()
++  {
++    if (joinable()) {
++      std::terminate();
++    }
++  }
++
++  bool            joinable() const { return active; }
++  void            join();
++  std::thread::id get_id() const { return id; }
++  ::pthread_t     native_handle() const { return handle; }
++
++private:
++  ::pthread_t     handle{};
++  std::thread::id id{};
++  bool            active = false;
++};
++
++#else
++
++using os_thread = std::thread;
++
++#endif // __APPLE__
++
++} // namespace detail
++
+ /// Unique thread wrapper that ensures the thread is joined on destruction and provides an interface to set/get
+ /// the thread name, priority, cpu mask.
+ class unique_thread
+@@ -237,15 +298,15 @@ public:
+ 
+ private:
+   /// Starts thread with provided name and attributes.
+-  static std::thread make_thread(const std::string&               name,
+-                                 unique_function<void()>          callable,
+-                                 os_thread_realtime_priority      prio     = os_thread_realtime_priority::no_realtime(),
+-                                 const os_sched_affinity_bitmask& cpu_mask = {});
++  static detail::os_thread make_thread(const std::string&               name,
++                                       unique_function<void()>          callable,
++                                       os_thread_realtime_priority      prio = os_thread_realtime_priority::no_realtime(),
++                                       const os_sched_affinity_bitmask& cpu_mask = {});
+ 
+   /// Thread name.
+   std::string name;
+ 
+-  std::thread thread_handle;
++  detail::os_thread thread_handle;
+ };
+ 
+ /// Print caller thread priority.
+diff --git a/lib/support/executors/unique_thread.cpp b/lib/support/executors/unique_thread.cpp
+index 0afec6a..e11a924 100644
+--- a/lib/support/executors/unique_thread.cpp
++++ b/lib/support/executors/unique_thread.cpp
+@@ -4,8 +4,12 @@
+ #include "ocudu/support/executors/unique_thread.h"
+ #include "ocudu/adt/scope_exit.h"
+ #include "ocudu/adt/static_vector.h"
++#include "ocudu/support/error_handling.h"
+ #include "fmt/std.h"
+ #include <cstdio>
++#include <cstring>
++#include <future>
++#include <memory>
+ #include <mutex>
+ #include <pthread.h>
+ #include <sys/types.h>
+@@ -258,13 +262,64 @@ os_sched_affinity_bitmask::subtract(const os_sched_affinity_bitmask& rhs) const
+ 
+ ///////////////////////////////////////
+ 
+-std::thread unique_thread::make_thread(const std::string&               name,
+-                                       unique_function<void()>          callable,
+-                                       os_thread_realtime_priority      prio,
+-                                       const os_sched_affinity_bitmask& cpu_mask)
++#ifdef __APPLE__
++
++namespace {
++
++/// What the new thread needs from its creator: the task, and a way to report its std::thread::id.
++struct os_thread_start {
++  unique_function<void()>       callable;
++  std::promise<std::thread::id> id;
++};
++
++void* os_thread_trampoline(void* arg)
++{
++  std::unique_ptr<os_thread_start> start(static_cast<os_thread_start*>(arg));
++  start->id.set_value(std::this_thread::get_id());
++  unique_function<void()> callable = std::move(start->callable);
++  start.reset();
++  callable();
++  return nullptr;
++}
++
++} // namespace
++
++detail::os_thread::os_thread(unique_function<void()> callable)
++{
++  auto start      = std::make_unique<os_thread_start>();
++  start->callable = std::move(callable);
++  std::future<std::thread::id> id_future = start->id.get_future();
++
++  ::pthread_attr_t attr;
++  ::pthread_attr_init(&attr);
++  ::pthread_attr_setstacksize(&attr, stack_size);
++  int ret = ::pthread_create(&handle, &attr, os_thread_trampoline, start.get());
++  ::pthread_attr_destroy(&attr);
++  if (ret != 0) {
++    report_fatal_error("Failed to create thread with a {} byte stack: {}", stack_size, ::strerror(ret));
++  }
++  start.release();
++  active = true;
++  id     = id_future.get();
++}
++
++void detail::os_thread::join()
++{
++  if (active) {
++    ::pthread_join(handle, nullptr);
++    active = false;
++  }
++}
++
++#endif // __APPLE__
++
++detail::os_thread unique_thread::make_thread(const std::string&               name,
++                                             unique_function<void()>          callable,
++                                             os_thread_realtime_priority      prio,
++                                             const os_sched_affinity_bitmask& cpu_mask)
+ {
+   // Launch thread.
+-  return std::thread([name, prio, cpu_mask, callable = std::move(callable)]() {
++  return detail::os_thread([name, prio, cpu_mask, callable = std::move(callable)]() {
+     std::string fixed_name = name;
+ 
+     // Truncate the thread name if it exceeds the maximum length.
+-- 
+2.55.0
+

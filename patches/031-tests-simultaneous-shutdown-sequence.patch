@@ -1,0 +1,51 @@
+From d1bb5a9c2af9ebefe754e1dd8ca3a03cee7856ed Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 13:08:47 +0300
+Subject: [PATCH] tests: accept a simultaneous SCTP shutdown without a separate
+ SHUTDOWN_EVENT
+
+when_client_sends_eof_before_processing_incoming_eof_then_shutdown_is_successful
+has the server and the client send EOF at the same time and then asserts
+that the client first sees SCTP_SHUTDOWN_EVENT (association still open)
+and only on the next read SCTP_SHUTDOWN_COMP. The Linux kernel emits both
+in that order. usrsctp, the stack behind libsctp-compat on macOS, resolves
+the simultaneous shutdown from SHUTDOWN-SENT straight to the completion
+and delivers SCTP_SHUTDOWN_COMP on the first read, so the intermediate
+assertion fails although the association closes correctly.
+
+Keep the strict sequence on Linux and, elsewhere, accept the completion
+on either read. What the test checks, that the client shuts down cleanly
+when both EOFs cross, holds on both stacks.
+---
+ .../unittests/gateways/sctp_network_client_test.cpp  | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/tests/unittests/gateways/sctp_network_client_test.cpp b/tests/unittests/gateways/sctp_network_client_test.cpp
+index 4795497..132e0ca 100644
+--- a/tests/unittests/gateways/sctp_network_client_test.cpp
++++ b/tests/unittests/gateways/sctp_network_client_test.cpp
+@@ -510,12 +510,18 @@ TEST_F(sctp_network_client_test, when_client_sends_eof_before_processing_incomin
+   // Client sends EOF
+   client_sender.reset();
+ 
+-  // Client receives an SCTP SHUTDOWN EVENT
++  // Client receives an SCTP SHUTDOWN EVENT, then an SCTP SHUTDOWN COMP.
+   trigger_broker();
++#ifdef __linux__
+   ASSERT_FALSE(recv_notifier_factory.destroyed);
+-
+-  // Client receives an SCTP SHUTDOWN COMP
+   trigger_broker();
++#else
++  // A stack that resolves a simultaneous shutdown without a separate SCTP_SHUTDOWN_EVENT, as usrsctp does, delivers
++  // SCTP_SHUTDOWN_COMP on the first read. Either way the association must end up closed.
++  if (not recv_notifier_factory.destroyed) {
++    trigger_broker();
++  }
++#endif
+   ASSERT_TRUE(recv_notifier_factory.destroyed);
+ 
+   // Server receives SCTP SHUTDOWN COMP
+-- 
+2.55.0
+

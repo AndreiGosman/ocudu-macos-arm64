@@ -1,0 +1,62 @@
+From 2944826e674311ff65de95d0e14b0c2e608e5e5e Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] apps: test metrics for zero with a comparison, not glibc's
+ iszero()
+
+iszero() is a glibc <math.h> macro from ISO/IEC TS 18661-1, available
+only with _GNU_SOURCE; Darwin's libm has no such macro and the scheduler
+metrics consumers fail with "use of undeclared identifier". The values
+are floats already checked for NaN on the same line, so x != 0.0F tests
+the same condition (true for neither +0 nor -0) on every libm.
+---
+ apps/helpers/metrics/json_generators/du_high/scheduler.cpp  | 6 +++---
+ .../metrics/consumers/scheduler_metrics_consumers.cpp       | 4 ++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/apps/helpers/metrics/json_generators/du_high/scheduler.cpp b/apps/helpers/metrics/json_generators/du_high/scheduler.cpp
+index f85cf5d..d950bb6 100644
+--- a/apps/helpers/metrics/json_generators/du_high/scheduler.cpp
++++ b/apps/helpers/metrics/json_generators/du_high/scheduler.cpp
+@@ -52,13 +52,13 @@ void to_json(nlohmann::json& json, const scheduler_ue_metrics& metrics)
+   json["dl_nof_ok"]  = metrics.dl_nof_ok;
+   json["dl_nof_nok"] = metrics.dl_nof_nok;
+   json["dl_bs"]      = metrics.dl_bs;
+-  if (!std::isnan(metrics.pusch_snr_db) && !iszero(metrics.pusch_snr_db)) {
++  if (!std::isnan(metrics.pusch_snr_db) && metrics.pusch_snr_db != 0.0F) {
+     json["pusch_snr_db"] = std::clamp(metrics.pusch_snr_db, -99.9f, 99.9f);
+   }
+-  if (!std::isnan(metrics.pusch_rsrp_db) && !iszero(metrics.pusch_rsrp_db)) {
++  if (!std::isnan(metrics.pusch_rsrp_db) && metrics.pusch_rsrp_db != 0.0F) {
+     json["pusch_rsrp_db"] = std::clamp(metrics.pusch_rsrp_db, -99.9f, 0.0f);
+   }
+-  if (!std::isnan(metrics.pucch_snr_db) && !iszero(metrics.pucch_snr_db)) {
++  if (!std::isnan(metrics.pucch_snr_db) && metrics.pucch_snr_db != 0.0F) {
+     json["pucch_snr_db"] = std::clamp(metrics.pucch_snr_db, -99.9f, 99.9f);
+   }
+ 
+diff --git a/apps/units/flexible_o_du/o_du_high/du_high/metrics/consumers/scheduler_metrics_consumers.cpp b/apps/units/flexible_o_du/o_du_high/du_high/metrics/consumers/scheduler_metrics_consumers.cpp
+index ee56d6e..c57ead8 100644
+--- a/apps/units/flexible_o_du/o_du_high/du_high/metrics/consumers/scheduler_metrics_consumers.cpp
++++ b/apps/units/flexible_o_du/o_du_high/du_high/metrics/consumers/scheduler_metrics_consumers.cpp
+@@ -87,7 +87,7 @@ void scheduler_cell_metrics_consumer_stdout::handle_metric(const scheduler_metri
+ 
+       fmt::print(" |");
+ 
+-      if (!std::isnan(ue.pusch_snr_db) && !iszero(ue.pusch_snr_db)) {
++      if (!std::isnan(ue.pusch_snr_db) && ue.pusch_snr_db != 0.0F) {
+         fmt::print(" {:>5.1f}", std::clamp(ue.pusch_snr_db, -99.9f, 99.9f));
+       } else {
+         fmt::print(" {:>5.5}", "n/a");
+@@ -324,7 +324,7 @@ void scheduler_cell_metrics_consumer_log::handle_metric(const scheduler_metrics_
+         fmt::format_to(std::back_inserter(buffer), " dl_olla={:.4}", ue.last_dl_olla.value());
+       }
+ 
+-      if (!std::isnan(ue.pusch_snr_db) && !iszero(ue.pusch_snr_db)) {
++      if (!std::isnan(ue.pusch_snr_db) && ue.pusch_snr_db != 0.0F) {
+         fmt::format_to(std::back_inserter(buffer), " pusch_snr_db={:.1f}", std::clamp(ue.pusch_snr_db, -99.9f, 99.9f));
+       } else {
+         fmt::format_to(std::back_inserter(buffer), " pusch_snr_db=n/a");
+-- 
+2.55.0
+

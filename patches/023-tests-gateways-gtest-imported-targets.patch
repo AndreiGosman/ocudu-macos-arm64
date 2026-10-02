@@ -1,0 +1,55 @@
+From 2574050fed0a64c04ad82a3fddca71761d46d521 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:24:22 +0300
+Subject: [PATCH] tests: link the gateway tests against the imported GTest
+ targets
+
+The five gateway test executables named GoogleTest as bare "gtest
+gtest_main", which only resolves when the libraries sit on the linker's
+default search path. The rest of the tree uses the GTest::gtest and
+GTest::gtest_main imported targets from find_package(GTest), which carry
+the library location, and on a host with GoogleTest under a prefix such
+as Homebrew's the bare names fail with "library 'gtest' not found".
+
+Use the imported targets here as well.
+---
+ tests/unittests/gateways/CMakeLists.txt | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/tests/unittests/gateways/CMakeLists.txt b/tests/unittests/gateways/CMakeLists.txt
+index a1e5d11..6a2988b 100644
+--- a/tests/unittests/gateways/CMakeLists.txt
++++ b/tests/unittests/gateways/CMakeLists.txt
+@@ -5,7 +5,7 @@
+ set_directory_properties(PROPERTIES LABELS "gateways")
+ 
+ add_executable(sctp_socket_test sctp_socket_test.cpp)
+-target_link_libraries(sctp_socket_test ocudu_gateway ocudulog gtest gtest_main)
++target_link_libraries(sctp_socket_test ocudu_gateway ocudulog GTest::gtest GTest::gtest_main)
+ target_include_directories(sctp_socket_test PRIVATE ${CMAKE_SOURCE_DIR})
+ gtest_discover_tests(sctp_socket_test NO_PRETTY_VALUES PROPERTIES "LABELS;sctp")
+ 
+@@ -14,7 +14,7 @@ add_executable(sctp_network_gateway_test
+         sctp_network_server_peer_test.cpp
+         sctp_network_client_test.cpp
+         sctp_network_link_test.cpp)
+-target_link_libraries(sctp_network_gateway_test ocudu_gateway ocudu_support ocudulog gtest gtest_main)
++target_link_libraries(sctp_network_gateway_test ocudu_gateway ocudu_support ocudulog GTest::gtest GTest::gtest_main)
+ target_include_directories(sctp_network_gateway_test PRIVATE ${CMAKE_SOURCE_DIR})
+ gtest_discover_tests(sctp_network_gateway_test NO_PRETTY_VALUES PROPERTIES "LABELS;sctp")
+ 
+@@ -56,9 +56,9 @@ if (OPENSSL_HAS_DTLS_SCTP)
+ endif()
+ 
+ add_executable(udp_network_gateway_test udp_network_gateway_test.cpp)
+-target_link_libraries(udp_network_gateway_test ocudu_gateway ocudu_support ocudulog gtest gtest_main)
++target_link_libraries(udp_network_gateway_test ocudu_gateway ocudu_support ocudulog GTest::gtest GTest::gtest_main)
+ gtest_discover_tests(udp_network_gateway_test PROPERTIES "LABELS;tsan")
+ 
+ add_executable(udp_network_gateway_pool_depletion_test udp_network_gateway_pool_depletion_test.cpp)
+-target_link_libraries(udp_network_gateway_pool_depletion_test ocudu_gateway ocudu_support ocudulog gtest gtest_main)
++target_link_libraries(udp_network_gateway_pool_depletion_test ocudu_gateway ocudu_support ocudulog GTest::gtest GTest::gtest_main)
+ gtest_discover_tests(udp_network_gateway_pool_depletion_test PROPERTIES "LABELS;tsan")
+-- 
+2.55.0
+

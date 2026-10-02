@@ -1,0 +1,147 @@
+From 955d62a3f39549df6c15f9bfd3bbc5be6341260a Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] ofh: build the raw-socket Ethernet transmitter and receiver
+ on Linux only
+
+The Open Fronthaul Ethernet transport opens AF_PACKET raw sockets,
+binds them with SO_BINDTODEVICE and reads with recvmmsg; it includes
+<linux/if_packet.h> and <netinet/ether.h>. None of this exists on
+Darwin, and the two implementation files are compiled unconditionally,
+even with DPDK off and no O-RU in the configuration.
+
+Compile the two implementations and their class declarations on Linux
+only. Elsewhere create_transmitter() and create_receiver() log that the
+transport is unavailable on this OS and return nullptr, which the RU
+factories already treat as a failure. The frame builders and decoders,
+which are plain code, keep building everywhere. This is a guard, not a
+port: a gNB on macOS runs with the ZeroMQ or UHD radio, not with a
+fronthaul RU.
+---
+ lib/ofh/ethernet/ethernet_factories.cpp        | 10 ++++++++++
+ lib/ofh/ethernet/ethernet_receiver_impl.cpp    |  4 ++++
+ lib/ofh/ethernet/ethernet_receiver_impl.h      |  5 +++++
+ lib/ofh/ethernet/ethernet_transmitter_impl.cpp |  4 ++++
+ lib/ofh/ethernet/ethernet_transmitter_impl.h   |  7 +++++++
+ 5 files changed, 30 insertions(+)
+
+diff --git a/lib/ofh/ethernet/ethernet_factories.cpp b/lib/ofh/ethernet/ethernet_factories.cpp
+index 6f89f42..331d4ef 100644
+--- a/lib/ofh/ethernet/ethernet_factories.cpp
++++ b/lib/ofh/ethernet/ethernet_factories.cpp
+@@ -14,13 +14,23 @@ using namespace ether;
+ std::unique_ptr<transmitter> ocudu::ether::create_transmitter(const transmitter_config& config,
+                                                               ocudulog::basic_logger&   logger)
+ {
++#ifdef __linux__
+   return std::make_unique<transmitter_impl>(config, logger);
++#else
++  logger.error("Open Fronthaul Ethernet transmitter is not available on this OS: raw AF_PACKET sockets are Linux only");
++  return nullptr;
++#endif
+ }
+ 
+ std::unique_ptr<receiver>
+ ocudu::ether::create_receiver(const receiver_config& config, task_executor& executor, ocudulog::basic_logger& logger)
+ {
++#ifdef __linux__
+   return std::make_unique<receiver_impl>(config, executor, logger);
++#else
++  logger.error("Open Fronthaul Ethernet receiver is not available on this OS: raw AF_PACKET sockets are Linux only");
++  return nullptr;
++#endif
+ }
+ 
+ std::unique_ptr<frame_builder> ocudu::ether::create_vlan_frame_builder(const vlan_frame_params& eth_params)
+diff --git a/lib/ofh/ethernet/ethernet_receiver_impl.cpp b/lib/ofh/ethernet/ethernet_receiver_impl.cpp
+index c8e0f94..293e5ae 100644
+--- a/lib/ofh/ethernet/ethernet_receiver_impl.cpp
++++ b/lib/ofh/ethernet/ethernet_receiver_impl.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
++// Open Fronthaul Ethernet over raw AF_PACKET sockets exists on Linux only. On other systems the factories report the
++// transport as unavailable, see ethernet_factories.cpp.
++#ifdef __linux__
+ #include "ethernet_receiver_impl.h"
+ #include "ethernet_rx_buffer_impl.h"
+ #include "ocudu/instrumentation/traces/ofh_traces.h"
+@@ -166,3 +169,4 @@ receiver_metrics_collector* receiver_impl::get_metrics_collector()
+ {
+   return metrics_collector.disabled() ? nullptr : &metrics_collector;
+ }
++#endif // __linux__
+diff --git a/lib/ofh/ethernet/ethernet_receiver_impl.h b/lib/ofh/ethernet/ethernet_receiver_impl.h
+index a0ba26f..4ba2d09 100644
+--- a/lib/ofh/ethernet/ethernet_receiver_impl.h
++++ b/lib/ofh/ethernet/ethernet_receiver_impl.h
+@@ -17,6 +17,9 @@ class task_executor;
+ 
+ namespace ether {
+ 
++// The raw AF_PACKET socket this receiver uses is a Linux interface.
++#ifdef __linux__
++
+ /// Implementation for the Ethernet receiver.
+ class receiver_impl : public receiver, private receiver_operation_controller
+ {
+@@ -58,5 +61,7 @@ private:
+   receiver_metrics_collector_impl metrics_collector;
+ };
+ 
++#endif // __linux__
++
+ } // namespace ether
+ } // namespace ocudu
+diff --git a/lib/ofh/ethernet/ethernet_transmitter_impl.cpp b/lib/ofh/ethernet/ethernet_transmitter_impl.cpp
+index 05e9cf2..0f16173 100644
+--- a/lib/ofh/ethernet/ethernet_transmitter_impl.cpp
++++ b/lib/ofh/ethernet/ethernet_transmitter_impl.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
++// Open Fronthaul Ethernet over raw AF_PACKET sockets exists on Linux only. On other systems the factories report the
++// transport as unavailable, see ethernet_factories.cpp.
++#ifdef __linux__
+ #include "ethernet_transmitter_impl.h"
+ #include "ocudu/support/error_handling.h"
+ #include <algorithm>
+@@ -97,3 +100,4 @@ transmitter_metrics_collector* transmitter_impl::get_metrics_collector()
+ {
+   return metrics_collector.disabled() ? nullptr : &metrics_collector;
+ }
++#endif // __linux__
+diff --git a/lib/ofh/ethernet/ethernet_transmitter_impl.h b/lib/ofh/ethernet/ethernet_transmitter_impl.h
+index 69bdef7..0e566e1 100644
+--- a/lib/ofh/ethernet/ethernet_transmitter_impl.h
++++ b/lib/ofh/ethernet/ethernet_transmitter_impl.h
+@@ -7,11 +7,16 @@
+ #include "ocudu/ocudulog/logger.h"
+ #include "ocudu/ofh/ethernet/ethernet_transmitter.h"
+ #include "ocudu/ofh/ethernet/ethernet_transmitter_config.h"
++#ifdef __linux__
+ #include <linux/if_packet.h>
++#endif
+ 
+ namespace ocudu {
+ namespace ether {
+ 
++// The raw AF_PACKET socket this transmitter uses is a Linux interface.
++#ifdef __linux__
++
+ /// Implementation for the Ethernet transmitter.
+ class transmitter_impl : public transmitter
+ {
+@@ -32,5 +37,7 @@ private:
+   ::sockaddr_ll                      socket_address;
+ };
+ 
++#endif // __linux__
++
+ } // namespace ether
+ } // namespace ocudu
+-- 
+2.55.0
+

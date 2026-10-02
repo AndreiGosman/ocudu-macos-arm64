@@ -1,0 +1,184 @@
+From ad4b7b2ff415711c285fcadfbe6a3e69d1311ded Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: provide cpu_set_t, sched_getcpu and
+ sched_getaffinity on Darwin
+
+cpu_set_t with its CPU_* helpers, sched_getcpu() and sched_getaffinity()
+are glibc extensions. cpu_architecture_info.h exposes a cpu_set_t in its
+public interface, bounded_object_pool.h and event_tracing.cpp pick a
+segment or record the CPU with sched_getcpu(), and the CPU discovery in
+cpu_architecture_info.cpp starts from sched_getaffinity(). None of them
+compile on Darwin.
+
+Add ocudu/support/os/sched_compat.h as a drop-in for <sched.h>. On Linux
+it only includes <sched.h>. On Darwin it adds a cpu_set_t of the glibc
+size with CPU_ZERO/SET/CLR/ISSET/COUNT, sched_getcpu() on top of
+pthread_cpu_number_np() (macOS 11.0+), and a sched_getaffinity() that
+reports every logical CPU from the hw.logicalcpu sysctl, because Darwin
+has no per-thread affinity mask to read. The four users include the new
+header instead of <sched.h>; their code is unchanged. On Darwin the CPU
+topology discovery then sees all CPUs as allowed, no SMT sibling lists
+and zero NUMA nodes, which is what the /sys readers also yield there.
+---
+ include/ocudu/support/cpu_architecture_info.h |  1 +
+ .../support/memory_pool/bounded_object_pool.h |  2 +-
+ include/ocudu/support/os/sched_compat.h       | 90 +++++++++++++++++++
+ lib/support/cpu_architecture_info.cpp         |  1 +
+ lib/support/tracing/event_tracing.cpp         |  2 +-
+ 5 files changed, 94 insertions(+), 2 deletions(-)
+ create mode 100644 include/ocudu/support/os/sched_compat.h
+
+diff --git a/include/ocudu/support/cpu_architecture_info.h b/include/ocudu/support/cpu_architecture_info.h
+index 165cef4..5007824 100644
+--- a/include/ocudu/support/cpu_architecture_info.h
++++ b/include/ocudu/support/cpu_architecture_info.h
+@@ -5,6 +5,7 @@
+ 
+ #include "ocudu/adt/bounded_bitset.h"
+ #include "ocudu/ocudulog/logger.h"
++#include "ocudu/support/os/sched_compat.h"
+ 
+ namespace ocudu {
+ 
+diff --git a/include/ocudu/support/memory_pool/bounded_object_pool.h b/include/ocudu/support/memory_pool/bounded_object_pool.h
+index b0727ef..e8db0a2 100644
+--- a/include/ocudu/support/memory_pool/bounded_object_pool.h
++++ b/include/ocudu/support/memory_pool/bounded_object_pool.h
+@@ -8,9 +8,9 @@
+ #include "ocudu/adt/noop_functor.h"
+ #include "ocudu/support/cpu_architecture_info.h"
+ #include "ocudu/support/math/math_utils.h"
++#include "ocudu/support/os/sched_compat.h"
+ #include <atomic>
+ #include <memory>
+-#include <sched.h>
+ #include <utility>
+ 
+ namespace ocudu {
+diff --git a/include/ocudu/support/os/sched_compat.h b/include/ocudu/support/os/sched_compat.h
+new file mode 100644
+index 0000000..367ceb7
+--- /dev/null
++++ b/include/ocudu/support/os/sched_compat.h
+@@ -0,0 +1,90 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++/// \file
++/// \brief Scheduler primitives that are Linux extensions, provided on Darwin.
++///
++/// cpu_set_t with the CPU_* helpers, sched_getcpu() and sched_getaffinity() are glibc extensions. Darwin has none of
++/// them: there is no CPU affinity mask API at all, and the running CPU is exposed through pthread_cpu_number_np()
++/// instead. This header is a drop-in for <sched.h>: on Linux it only includes <sched.h>; on Darwin it adds the missing
++/// pieces so the callers compile unchanged.
++
++#include <sched.h>
++
++#ifdef __APPLE__
++
++#include <cstdint>
++#include <cstring>
++#include <pthread.h>
++#include <sys/sysctl.h>
++#include <sys/types.h>
++
++/// Size of the emulated CPU set, matching glibc.
++#define CPU_SETSIZE 1024
++
++/// CPU set with the same capacity as the glibc one.
++struct cpu_set_t {
++  uint64_t bits[CPU_SETSIZE / 64];
++};
++
++inline void CPU_ZERO(cpu_set_t* set)
++{
++  std::memset(set, 0, sizeof(*set));
++}
++
++inline void CPU_SET(unsigned cpu, cpu_set_t* set)
++{
++  if (cpu < CPU_SETSIZE) {
++    set->bits[cpu / 64] |= (uint64_t{1} << (cpu % 64));
++  }
++}
++
++inline void CPU_CLR(unsigned cpu, cpu_set_t* set)
++{
++  if (cpu < CPU_SETSIZE) {
++    set->bits[cpu / 64] &= ~(uint64_t{1} << (cpu % 64));
++  }
++}
++
++inline int CPU_ISSET(unsigned cpu, const cpu_set_t* set)
++{
++  return cpu < CPU_SETSIZE and ((set->bits[cpu / 64] >> (cpu % 64)) & 1U) != 0;
++}
++
++inline int CPU_COUNT(const cpu_set_t* set)
++{
++  int count = 0;
++  for (uint64_t word : set->bits) {
++    count += __builtin_popcountll(word);
++  }
++  return count;
++}
++
++/// Returns the CPU the calling thread is running on, or -1 if the OS does not say.
++inline int sched_getcpu()
++{
++  size_t cpu = 0;
++  return ::pthread_cpu_number_np(&cpu) == 0 ? static_cast<int>(cpu) : -1;
++}
++
++/// \brief Fills \c set with every logical CPU of the host.
++///
++/// Darwin has no per-thread affinity mask, so every CPU is always allowed. The pid and size arguments are accepted
++/// for signature compatibility and ignored.
++inline int sched_getaffinity(pid_t /* pid */, size_t /* cpusetsize */, cpu_set_t* set)
++{
++  int    nof_cpus = 0;
++  size_t len      = sizeof(nof_cpus);
++  if (::sysctlbyname("hw.logicalcpu", &nof_cpus, &len, nullptr, 0) != 0 or nof_cpus <= 0) {
++    nof_cpus = 1;
++  }
++  CPU_ZERO(set);
++  for (int i = 0; i < nof_cpus and i < CPU_SETSIZE; ++i) {
++    CPU_SET(static_cast<unsigned>(i), set);
++  }
++  return 0;
++}
++
++#endif // __APPLE__
+diff --git a/lib/support/cpu_architecture_info.cpp b/lib/support/cpu_architecture_info.cpp
+index 4987501..f9ea90e 100644
+--- a/lib/support/cpu_architecture_info.cpp
++++ b/lib/support/cpu_architecture_info.cpp
+@@ -5,6 +5,7 @@
+ #include "ocudu/adt/interval.h"
+ #include "ocudu/ocudulog/ocudulog.h"
+ #include "ocudu/support/format/fmt_to_c_str.h"
++#include "ocudu/support/os/sched_compat.h"
+ #include "ocudu/support/sysinfo.h"
+ #include <dirent.h>
+ #include <fstream>
+diff --git a/lib/support/tracing/event_tracing.cpp b/lib/support/tracing/event_tracing.cpp
+index 6a71cb3..acae7fa 100644
+--- a/lib/support/tracing/event_tracing.cpp
++++ b/lib/support/tracing/event_tracing.cpp
+@@ -8,9 +8,9 @@
+ #include "ocudu/support/format/custom_formattable.h"
+ #include "ocudu/support/format/fmt_basic_parser.h"
+ #include "ocudu/support/format/fmt_to_c_str.h"
++#include "ocudu/support/os/sched_compat.h"
+ #include "ocudu/support/tracing/rusage_trace_recorder.h"
+ #include "fmt/chrono.h"
+-#include <sched.h>
+ 
+ using namespace ocudu;
+ using namespace std::chrono;
+-- 
+2.55.0
+

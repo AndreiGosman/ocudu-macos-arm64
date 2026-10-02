@@ -1,0 +1,55 @@
+From 74b854f13cd0e63d308453ae4646f84fc2b7b1a7 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:45:56 +0300
+Subject: [PATCH] tests: wait briefly for the peer's event in the SCTP test
+ node
+
+dummy_sctp_node::receive() reads the non-blocking test socket right after
+the call under test returned and expects the peer's notification or data
+to be there. With the Linux kernel stack that holds: the server side has
+queued SCTP_COMM_UP before the client's connect() returns. With a
+user-space stack behind the same socket API, usrsctp through
+libsctp-compat on macOS, the peer's event is delivered by another thread
+a few microseconds to milliseconds later, and the immediate read finds
+nothing (0 of 20 attempts immediately, 20 of 20 within 50 ms in a
+standalone measurement).
+
+Poll the socket for up to 100 ms before reading. Tests that assert the
+absence of further data still pass, 100 ms later.
+---
+ tests/unittests/gateways/sctp_test_helpers.h | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/tests/unittests/gateways/sctp_test_helpers.h b/tests/unittests/gateways/sctp_test_helpers.h
+index 6d9dd97..051f511 100644
+--- a/tests/unittests/gateways/sctp_test_helpers.h
++++ b/tests/unittests/gateways/sctp_test_helpers.h
+@@ -6,6 +6,7 @@
+ #include "ocudu/gateways/sctp_socket.h"
+ #include "ocudu/ocudulog/ocudulog.h"
+ #include "ocudu/support/io/io_broker.h"
++#include <poll.h>
+ #include <arpa/inet.h>
+ #include <map>
+ #include <netdb.h>
+@@ -118,6 +119,17 @@ public:
+ 
+     test_recv_data data;
+ 
++    // The tests read the peer's reaction right after their own call returned. With the kernel stack the peer side has
++    // already queued its notification by then; with a user-space stack behind the socket API (usrsctp on macOS) the
++    // peer's event arrives a little later on another thread. Wait briefly for readability so the test observes the
++    // same ordering on both.
++    {
++      ::pollfd pfd = {socket.fd().value(), POLLIN, 0};
++      if (::poll(&pfd, 1, 100) <= 0) {
++        return std::nullopt;
++      }
++    }
++
+     std::array<uint8_t, network_gateway_sctp_max_len> temp_buf;
+     int                                               rx_bytes = ::sctp_recvmsg(socket.fd().value(),
+                                   temp_buf.data(),
+-- 
+2.55.0
+

@@ -1,0 +1,115 @@
+From 1782f1fd54f6102e781e5a677cdefad74dc21a23 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:21:40 +0300
+Subject: [PATCH] gateways: provide sendmmsg and recvmmsg on Darwin for the UDP
+ gateway
+
+udp_network_gateway_impl batches its socket I/O with sendmmsg(2) and
+recvmmsg(2) over struct mmsghdr, and receives with MSG_WAITFORONE. All
+four are Linux-only; Darwin has neither the calls nor the structure.
+
+Add ocudu/support/os/mmsg_compat.h as a drop-in for <sys/socket.h>. On
+Linux it only includes that header. On Darwin it declares struct mmsghdr
+and implements the two calls as loops over sendmsg(2) and recvmsg(2) with
+the Linux contract: the count of messages transferred is returned, -1
+with errno only when the first one fails, and under MSG_WAITFORONE the
+first receive honours the socket's blocking mode while the following
+ones pass MSG_DONTWAIT. MSG_WAITFORONE takes a bit Darwin does not use
+(the Linux value is Darwin's MSG_NEEDSA) and is stripped before recvmsg.
+The gateway source is unchanged apart from the include.
+---
+ include/ocudu/support/os/mmsg_compat.h  | 67 +++++++++++++++++++++++++
+ lib/gateways/udp_network_gateway_impl.h |  2 +-
+ 2 files changed, 68 insertions(+), 1 deletion(-)
+ create mode 100644 include/ocudu/support/os/mmsg_compat.h
+
+diff --git a/include/ocudu/support/os/mmsg_compat.h b/include/ocudu/support/os/mmsg_compat.h
+new file mode 100644
+index 0000000..4c8e56a
+--- /dev/null
++++ b/include/ocudu/support/os/mmsg_compat.h
+@@ -0,0 +1,67 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++/// \file
++/// \brief sendmmsg(2) and recvmmsg(2), provided on Darwin as loops over sendmsg(2) and recvmsg(2).
++///
++/// The batched message calls are Linux-only. This header is a drop-in for <sys/socket.h>: on Linux it only includes
++/// it; on Darwin it adds struct mmsghdr, MSG_WAITFORONE and the two calls, with the Linux contract: the number of
++/// messages transferred is returned, -1 with errno only when the first one fails, and with MSG_WAITFORONE the first
++/// receive honours the socket's blocking mode while the following ones do not wait.
++
++#include <sys/socket.h>
++
++#ifdef __APPLE__
++
++#include <cerrno>
++#include <ctime>
++
++/// Linux: "wait for one message, then return whatever else is already queued". The Linux value (0x10000) is Darwin's
++/// MSG_NEEDSA, so a free bit is used here; recvmmsg() strips it before calling recvmsg().
++#ifndef MSG_WAITFORONE
++#define MSG_WAITFORONE 0x20000000
++#endif
++
++struct mmsghdr {
++  struct msghdr msg_hdr;
++  unsigned      msg_len;
++};
++
++inline int sendmmsg(int sockfd, struct mmsghdr* msgvec, unsigned vlen, int flags)
++{
++  unsigned sent = 0;
++  for (; sent < vlen; ++sent) {
++    ssize_t ret = ::sendmsg(sockfd, &msgvec[sent].msg_hdr, flags);
++    if (ret < 0) {
++      // Linux reports the error only when nothing was sent; otherwise it returns the count and the error waits for
++      // the next call.
++      return sent == 0 ? -1 : static_cast<int>(sent);
++    }
++    msgvec[sent].msg_len = static_cast<unsigned>(ret);
++  }
++  return static_cast<int>(sent);
++}
++
++inline int recvmmsg(int sockfd, struct mmsghdr* msgvec, unsigned vlen, int flags, struct timespec* /* timeout */)
++{
++  const bool wait_for_one = (flags & MSG_WAITFORONE) != 0;
++  flags &= ~MSG_WAITFORONE;
++
++  unsigned received = 0;
++  for (; received < vlen; ++received) {
++    int call_flags = flags;
++    if (wait_for_one and received > 0) {
++      call_flags |= MSG_DONTWAIT;
++    }
++    ssize_t ret = ::recvmsg(sockfd, &msgvec[received].msg_hdr, call_flags);
++    if (ret < 0) {
++      return received == 0 ? -1 : static_cast<int>(received);
++    }
++    msgvec[received].msg_len = static_cast<unsigned>(ret);
++  }
++  return static_cast<int>(received);
++}
++
++#endif // __APPLE__
+diff --git a/lib/gateways/udp_network_gateway_impl.h b/lib/gateways/udp_network_gateway_impl.h
+index 7c69cde..2d031c6 100644
+--- a/lib/gateways/udp_network_gateway_impl.h
++++ b/lib/gateways/udp_network_gateway_impl.h
+@@ -7,8 +7,8 @@
+ #include "ocudu/gateways/udp_network_gateway.h"
+ #include "ocudu/support/executors/task_executor.h"
+ #include "ocudu/support/io/unique_fd.h"
++#include "ocudu/support/os/mmsg_compat.h"
+ #include <netdb.h>
+-#include <sys/socket.h>
+ 
+ namespace ocudu {
+ 
+-- 
+2.55.0
+

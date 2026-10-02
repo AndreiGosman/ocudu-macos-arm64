@@ -1,0 +1,96 @@
+From 4f9866c4f30287d68e990ecfa00f3ffbc17b8b5e Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:27:51 +0300
+Subject: [PATCH] gateways: resolve SCTP endpoints through sctp_getaddrinfo
+
+sockaddr_searcher resolves bind and connect addresses with getaddrinfo(3)
+and hints naming SOCK_SEQPACKET and IPPROTO_SCTP. glibc resolves those.
+The Darwin resolver knows only TCP and UDP and answers EAI_BADHINTS ("Bad
+hints") for any SCTP hint, numeric host or not, so no SCTP gateway could
+be created there: "Failed to resolve any bind addresses" for 127.0.0.1.
+
+Add sctp_getaddrinfo() next to sctp_socket. On Linux it is getaddrinfo.
+On Darwin, when the hints ask for SCTP, it resolves with a datagram hint
+the resolver accepts and rewrites every result's ai_socktype and
+ai_protocol back to the values the caller asked for, so the result list
+is identical on both systems and the rest of the code is unchanged.
+sockaddr_searcher uses it.
+---
+ include/ocudu/gateways/sctp_socket.h          |  9 ++++++++
+ .../sctp_network_gateway_common_impl.cpp      |  2 +-
+ lib/gateways/sctp_socket.cpp                  | 21 +++++++++++++++++++
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/include/ocudu/gateways/sctp_socket.h b/include/ocudu/gateways/sctp_socket.h
+index 8a8d66e..e55486f 100644
+--- a/include/ocudu/gateways/sctp_socket.h
++++ b/include/ocudu/gateways/sctp_socket.h
+@@ -10,11 +10,20 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <netinet/in.h>
++#include <netdb.h>
+ #include <netinet/sctp.h>
+ #include <sys/socket.h>
+ 
+ namespace ocudu {
+ 
++/// \brief getaddrinfo(3) for SCTP endpoints.
++///
++/// Resolves \p node and \p service with the given \p hints exactly like getaddrinfo(3). Linux resolves hints that
++/// name SOCK_SEQPACKET and IPPROTO_SCTP; the Darwin resolver knows only TCP and UDP and answers EAI_BADHINTS for them.
++/// There the lookup is made with a hint the resolver accepts and every result is rewritten to carry the SCTP socket
++/// type and protocol the caller asked for, so the result list is the same on both systems. Free it with freeaddrinfo.
++int sctp_getaddrinfo(const char* node, const char* service, const addrinfo* hints, addrinfo** res);
++
+ struct sctp_socket_params {
+   /// Name of the interface for logging purposes.
+   std::string                              if_name;
+diff --git a/lib/gateways/sctp_network_gateway_common_impl.cpp b/lib/gateways/sctp_network_gateway_common_impl.cpp
+index aeed32e..be0955c 100644
+--- a/lib/gateways/sctp_network_gateway_common_impl.cpp
++++ b/lib/gateways/sctp_network_gateway_common_impl.cpp
+@@ -82,7 +82,7 @@ sockaddr_searcher::sockaddr_searcher(const std::string& address, int port, ocudu
+   hints.ai_next      = nullptr;
+ 
+   std::string port_str = std::to_string(port);
+-  int         ret      = ::getaddrinfo(address.c_str(), port_str.c_str(), &hints, &results);
++  int         ret      = sctp_getaddrinfo(address.c_str(), port_str.c_str(), &hints, &results);
+   if (ret != 0) {
+     logger.error("Error in \"getaddrinfo\" for \"{}\":{}. Cause: {}", address, port, ::gai_strerror(ret));
+     results = nullptr;
+diff --git a/lib/gateways/sctp_socket.cpp b/lib/gateways/sctp_socket.cpp
+index 1cf07b6..2be5c4e 100644
+--- a/lib/gateways/sctp_socket.cpp
++++ b/lib/gateways/sctp_socket.cpp
+@@ -13,6 +13,27 @@
+ 
+ using namespace ocudu;
+ 
++int ocudu::sctp_getaddrinfo(const char* node, const char* service, const addrinfo* hints, addrinfo** res)
++{
++#ifdef __APPLE__
++  if (hints != nullptr and (hints->ai_protocol == IPPROTO_SCTP or hints->ai_socktype == SOCK_SEQPACKET)) {
++    // Resolve as a datagram endpoint, which the Darwin resolver accepts, then put the SCTP values back.
++    addrinfo sctp_hints    = *hints;
++    sctp_hints.ai_socktype = SOCK_DGRAM;
++    sctp_hints.ai_protocol = 0;
++    int ret                = ::getaddrinfo(node, service, &sctp_hints, res);
++    if (ret == 0) {
++      for (addrinfo* ai = *res; ai != nullptr; ai = ai->ai_next) {
++        ai->ai_socktype = hints->ai_socktype != 0 ? hints->ai_socktype : SOCK_SEQPACKET;
++        ai->ai_protocol = IPPROTO_SCTP;
++      }
++    }
++    return ret;
++  }
++#endif
++  return ::getaddrinfo(node, service, hints, res);
++}
++
+ /// Subscribes to a single SCTP event type.
+ static bool sctp_subscribe_to_event(const unique_fd& fd, uint16_t event_type)
+ {
+-- 
+2.55.0
+

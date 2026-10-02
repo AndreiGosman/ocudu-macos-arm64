@@ -1,0 +1,30 @@
+From 99f4d05c7c40187dd2e295712a31219aa9485ca2 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:07:28 +0300
+Subject: [PATCH] radio: compare the zero-fill length and the sample gap as
+ uint64_t in the ZeroMQ transmitter
+
+radio_zmq_tx_channel takes std::min of the zero buffer size (size_t) and
+the gap to the requested timestamp (uint64_t). On glibc/x86-64 both are
+unsigned long; on Darwin uint64_t is unsigned long long and std::min
+cannot deduce a common type. Name the type explicitly.
+---
+ lib/radio/zmq/radio_zmq_tx_channel.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/radio/zmq/radio_zmq_tx_channel.cpp b/lib/radio/zmq/radio_zmq_tx_channel.cpp
+index 72ada61..7ae753b 100644
+--- a/lib/radio/zmq/radio_zmq_tx_channel.cpp
++++ b/lib/radio/zmq/radio_zmq_tx_channel.cpp
+@@ -278,7 +278,7 @@ bool radio_zmq_tx_channel::align(uint64_t timestamp, std::chrono::milliseconds t
+   std::array<cf_t, 1024> zero_buffer = {};
+   // Transmit zeros until the sample count reaches the timestamp.
+   while (sample_count < timestamp && state_fsm.is_running()) {
+-    unsigned   to_send = std::min(zero_buffer.size(), timestamp - sample_count);
++    unsigned   to_send = std::min<uint64_t>(zero_buffer.size(), timestamp - sample_count);
+     span<cf_t> zeros   = span<cf_t>(zero_buffer.begin(), to_send);
+     transmit_samples(zeros);
+     count += zeros.size();
+-- 
+2.55.0
+

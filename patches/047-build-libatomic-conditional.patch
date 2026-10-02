@@ -1,0 +1,64 @@
+From 060c3833870f6ae250662135f5f1b5001361c4d7 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:09:33 +0300
+Subject: [PATCH] build: link libatomic only on platforms that have it
+
+ocudu_mac and the lock-free token bucket test link "atomic" by name for
+the out-of-line atomic operations GCC/libstdc++ keeps in libatomic.
+Darwin has no such library: with libc++ the operations live in
+libSystem, and the link fails with "library 'atomic' not found".
+
+Introduce OCUDU_LIBATOMIC, set to atomic everywhere but Darwin, and use
+it in both places. The test also takes GTest::gtest through the imported
+target, as the other tests do since the gateway test change.
+---
+ CMakeLists.txt                                       | 6 ++++++
+ lib/mac/CMakeLists.txt                               | 2 +-
+ tests/unittests/support/rate_limiting/CMakeLists.txt | 2 +-
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8b99b3a..d1e1e5f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -537,6 +537,12 @@ endif (BUILD_TESTING)
+ # Threads
+ find_package(Threads REQUIRED)
+ 
++# libatomic provides the out-of-line atomic operations for GCC/libstdc++ and is linked explicitly where the code relies
++# on them. Darwin ships them inside libSystem with libc++ and has no libatomic to link.
++if (NOT APPLE)
++    set(OCUDU_LIBATOMIC atomic)
++endif ()
++
+ # UHD
+ if (ENABLE_UHD)
+     find_package(UHD)
+diff --git a/lib/mac/CMakeLists.txt b/lib/mac/CMakeLists.txt
+index b152e89..912d707 100644
+--- a/lib/mac/CMakeLists.txt
++++ b/lib/mac/CMakeLists.txt
+@@ -41,7 +41,7 @@ set(SOURCES mac_factory.cpp
+ 
+ add_library(ocudu_mac STATIC ${SOURCES})
+ target_link_libraries(ocudu_mac
+-        atomic
++        ${OCUDU_LIBATOMIC}
+         ocudu_sched
+         mac_configuration_helpers
+         ocudu_ran
+diff --git a/tests/unittests/support/rate_limiting/CMakeLists.txt b/tests/unittests/support/rate_limiting/CMakeLists.txt
+index dcb895e..483dd22 100644
+--- a/tests/unittests/support/rate_limiting/CMakeLists.txt
++++ b/tests/unittests/support/rate_limiting/CMakeLists.txt
+@@ -8,6 +8,6 @@ target_include_directories(token_bucket_test PRIVATE ${CMAKE_SOURCE_DIR})
+ add_test(token_bucket_test token_bucket_test)
+ 
+ add_executable(lockfree_token_bucket_test lockfree_token_bucket_test.cpp)
+-target_link_libraries(lockfree_token_bucket_test ocudu_support atomic ocudulog gtest GTest::gtest_main)
++target_link_libraries(lockfree_token_bucket_test ocudu_support ${OCUDU_LIBATOMIC} ocudulog GTest::gtest GTest::gtest_main)
+ target_include_directories(lockfree_token_bucket_test PRIVATE ${CMAKE_SOURCE_DIR})
+ add_test(lockfree_token_bucket_test lockfree_token_bucket_test)
+-- 
+2.55.0
+

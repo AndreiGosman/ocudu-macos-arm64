@@ -1,0 +1,45 @@
+From 2e084fc521fe799c81779a77d17db627d1ee6d85 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] build: give the bundled fmt priority over a system-wide one
+
+external/fmt/src/format.cc includes "fmt/format-inl.h". That does not
+resolve next to the source file, so the quoted include falls through to
+the -I list. The top-level CMakeLists.txt adds external/fmt/include
+without BEFORE, after the include directories that find_package(UHD) and
+find_package(ZeroMQ) added without SYSTEM. On a host where those live in
+the same prefix as an installed fmt, Homebrew's /opt/homebrew/include on
+macOS, the bundled format.cc is compiled against the installed headers.
+With fmt 12 installed next to the bundled 11.1.3 this fails with
+
+  explicit instantiation of 'locale_ref' not in a namespace enclosing 'v12'
+
+Add BEFORE so the tree compiles against its own copy whatever else is
+installed. Nothing about this is specific to macOS; any system with fmt
+on an explicit include path was exposed the same way.
+---
+ CMakeLists.txt | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5ad4e0a..204998c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -729,7 +729,13 @@ unset(_dart_config)
+ unset(_dart_contents)
+ 
+ include_directories(include)
+-include_directories(external/fmt/include)
++# BEFORE matters. external/fmt/src/format.cc includes "fmt/format-inl.h", which
++# does not resolve next to the source file and falls through to the -I list.
++# Dependencies found earlier (UHD, ZeroMQ) add their include directories
++# without SYSTEM, so a system-wide fmt on the same prefix, for example the
++# Homebrew one on macOS, is reached first and supplies another major version
++# of the library than the one bundled in the tree.
++include_directories(BEFORE external/fmt/include)
+ include_directories(external)
+ 
+ ########################################################################
+-- 
+2.55.0
+

@@ -1,0 +1,38 @@
+From 61e6038a3705fd2d0dbe5a93cfbbf0763fcc2140 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:40 +0300
+Subject: [PATCH] external: build CLI11 without <codecvt> on libc++
+
+CLI11's narrow()/widen() helpers use std::wstring_convert with
+std::codecvt_utf8, which libc++ marks deprecated (both are removed in
+C++26). The project compiles with -Werror, and -Wdeprecated-declarations
+fires at the instantiation inside libc++'s own header, where CLI11's
+diagnostic pragmas do not reach, so every translation unit that includes
+CLI11 fails on macOS.
+
+CLI11 already carries a wcsrtombs/mbsrtowcs fallback for compilers
+without <codecvt>. Select it whenever libc++ is the standard library, by
+_LIBCPP_VERSION, which the standard headers CLI11 includes first define.
+The conversions produce the same strings.
+---
+ external/CLI/CLI11.hpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/external/CLI/CLI11.hpp b/external/CLI/CLI11.hpp
+index 8a5b4c5..fce4cb2 100644
+--- a/external/CLI/CLI11.hpp
++++ b/external/CLI/CLI11.hpp
+@@ -160,6 +160,10 @@
+ /** <codecvt> availability */
+ #if defined(__GNUC__) && !defined(__llvm__) && !defined(__INTEL_COMPILER) && __GNUC__ < 5
+ #define CLI11_HAS_CODECVT 0
++#elif defined(_LIBCPP_VERSION)
++// libc++ deprecates std::wstring_convert and std::codecvt_utf8 (removed in C++26); under -Werror the use below fails.
++// CLI11 has a wcsrtombs/mbsrtowcs fallback that does the same work without them.
++#define CLI11_HAS_CODECVT 0
+ #else
+ #define CLI11_HAS_CODECVT 1
+ #include <codecvt>
+-- 
+2.55.0
+

@@ -1,0 +1,66 @@
+From 57d2d8df74fbb4e2e1773d389df592174dc91c83 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: pass SO_BINDTODEVICE the interface name, not a glibc
+ ifreq
+
+bind_to_interface() filled ifr_ifrn.ifrn_name, a member that only glibc
+spells that way, and handed the whole ifreq to SO_BINDTODEVICE. The
+option itself takes a NUL-terminated interface name of at most IFNAMSIZ
+bytes, on Linux as documented in socket(7) and on Darwin, whose SDK now
+declares SO_BINDTODEVICE with that exact contract. The ifreq only worked
+because the kernel read its first IFNAMSIZ bytes.
+
+Pass a char[IFNAMSIZ] buffer instead, which compiles and means the same
+thing on both systems. Where SO_BINDTODEVICE is not defined at all, log
+that an explicit interface cannot be honoured and return false; the
+default "auto" and empty values still return true before that point.
+Whether the Darwin kernel honours the option at run time was not tested
+in this change.
+---
+ lib/support/network/sockets.cpp | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/lib/support/network/sockets.cpp b/lib/support/network/sockets.cpp
+index 115e85a..123d29b 100644
+--- a/lib/support/network/sockets.cpp
++++ b/lib/support/network/sockets.cpp
+@@ -55,18 +55,26 @@ bool ocudu::bind_to_interface(const unique_fd& fd, const std::string& interface,
+     return true;
+   }
+ 
+-  ifreq ifr{};
+-  std::strncpy(ifr.ifr_ifrn.ifrn_name, interface.c_str(), IFNAMSIZ - 1);
+-  ifr.ifr_ifrn.ifrn_name[IFNAMSIZ - 1] = 0; // ensure null termination in case input exceeds maximum length
+-
+-  if (::setsockopt(fd.value(), SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
+-    logger.error("fd={}: Could not bind socket to interface \"{}\". errno=\"{}\"",
+-                 fd.value(),
+-                 ifr.ifr_ifrn.ifrn_name,
+-                 ::strerror(errno));
++#ifdef SO_BINDTODEVICE
++  // SO_BINDTODEVICE takes the interface name as a NUL-terminated string of at most IFNAMSIZ bytes on both Linux and
++  // Darwin. Passing a whole ifreq relied on the glibc-only ifr_ifrn member and on the kernel reading only its first
++  // IFNAMSIZ bytes.
++  char ifname[IFNAMSIZ] = {};
++  std::strncpy(ifname, interface.c_str(), IFNAMSIZ - 1);
++  ifname[IFNAMSIZ - 1] = 0; // ensure null termination in case input exceeds maximum length
++
++  if (::setsockopt(fd.value(), SOL_SOCKET, SO_BINDTODEVICE, ifname, sizeof(ifname)) < 0) {
++    logger.error(
++        "fd={}: Could not bind socket to interface \"{}\". errno=\"{}\"", fd.value(), ifname, ::strerror(errno));
+     return false;
+   }
+   return true;
++#else
++  logger.error("fd={}: Could not bind socket to interface \"{}\". Cause: SO_BINDTODEVICE is not supported on this OS.",
++               fd.value(),
++               interface);
++  return false;
++#endif
+ }
+ 
+ bool ocudu::sockaddr_to_ip_str(const sockaddr* addr, std::string& ip_address, ocudulog::basic_logger& logger)
+-- 
+2.55.0
+

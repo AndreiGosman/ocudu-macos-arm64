@@ -1,0 +1,73 @@
+From efda40e1fa9f70649a67c12a72a88666a92968be Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:04:39 +0300
+Subject: [PATCH] pcap: write the UDP pseudo-header from a local struct, not
+ <linux/udp.h>
+
+backend_pcap_writer.cpp prepends a UDP header to every PCAP record and
+took the structure from <linux/udp.h>, a header only Linux has. The
+writer needs just the four 16-bit fields in network byte order, so
+declare them locally with the same names and layout and drop the Linux
+include. The bytes written to the capture are identical.
+---
+ lib/pcap/backend_pcap_writer.cpp | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/lib/pcap/backend_pcap_writer.cpp b/lib/pcap/backend_pcap_writer.cpp
+index cb17a69..1ea3720 100644
+--- a/lib/pcap/backend_pcap_writer.cpp
++++ b/lib/pcap/backend_pcap_writer.cpp
+@@ -3,12 +3,28 @@
+ 
+ #include "backend_pcap_writer.h"
+ #include "ocudu/support/executors/sync_task_executor.h"
+-#include <linux/udp.h>
++#include <cstdint>
+ #include <netinet/in.h>
+ #include <thread>
+ 
+ using namespace ocudu;
+ 
++namespace {
++
++/// UDP header written in front of every PCAP record, fields in network byte order.
++///
++/// The writer used the Linux kernel's UDP header structure from <linux/udp.h>, a header other systems do not have. The
++/// PCAP format only needs the four 16-bit fields, so they are declared here with the same names and layout.
++struct pcap_udp_header {
++  uint16_t source;
++  uint16_t dest;
++  uint16_t len;
++  uint16_t check;
++};
++static_assert(sizeof(pcap_udp_header) == 8, "UDP header must be 8 bytes");
++
++} // namespace
++
+ pcap_pdu_data::pcap_pdu_data(uint16_t            src,
+                              uint16_t            dest,
+                              const char*         layer_str,
+@@ -18,17 +34,17 @@ pcap_pdu_data::pcap_pdu_data(uint16_t            src,
+   const size_t layer_str_len = strlen(layer_str);
+ 
+   // Add dummy UDP header, start with src and dest port
+-  udphdr udp_header;
++  pcap_udp_header udp_header;
+   udp_header.source = htons(src);
+   udp_header.dest   = htons(dest);
+   // length
+-  unsigned length = sizeof(udphdr) + layer_str_len + context_header.size() + payload_.length();
++  unsigned length = sizeof(pcap_udp_header) + layer_str_len + context_header.size() + payload_.length();
+   ocudu_assert(length < std::numeric_limits<uint16_t>::max(), "PDU length is too large");
+   udp_header.len = htons(length);
+   // dummy CRC
+   udp_header.check = 0x0;
+ 
+-  if (not header_buf.append(span<const uint8_t>{(const uint8_t*)&udp_header, sizeof(udphdr)}) or
++  if (not header_buf.append(span<const uint8_t>{(const uint8_t*)&udp_header, sizeof(pcap_udp_header)}) or
+       not header_buf.append(span<const uint8_t>{(const uint8_t*)layer_str, layer_str_len}) or
+       not header_buf.append(context_header)) {
+     header_buf.clear();
+-- 
+2.55.0
+

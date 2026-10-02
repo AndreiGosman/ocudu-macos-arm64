@@ -1,0 +1,57 @@
+From ec5f283430fd04d4f0f5724a3b29bbae225f5702 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: query PMULL through sysctl on Darwin, not getauxval
+
+cpu_features.h reads the ARM hardware capability word through getauxval,
+declared in <sys/auxv.h> with the bit names in <asm/hwcap.h>. Both
+headers are Linux-only and are included under __aarch64__, which Apple
+clang defines on arm64, so every translation unit that pulls the header
+fails on Darwin.
+
+Keep the auxiliary vector on Linux and read the hw.optional.arm.FEAT_PMULL
+sysctl on Darwin, which is how XNU publishes the ARM feature flags. Other
+platforms report the feature as absent.
+---
+ include/ocudu/support/cpu_features.h | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/include/ocudu/support/cpu_features.h b/include/ocudu/support/cpu_features.h
+index e98809f..abb74cc 100644
+--- a/include/ocudu/support/cpu_features.h
++++ b/include/ocudu/support/cpu_features.h
+@@ -8,8 +8,12 @@
+ #include "fmt/format.h"
+ 
+ #ifdef __aarch64__
++#ifdef __linux__
+ #include <asm/hwcap.h>
+ #include <sys/auxv.h>
++#elif defined(__APPLE__)
++#include <sys/sysctl.h>
++#endif
+ #endif // __aarch64__
+ 
+ namespace ocudu {
+@@ -129,7 +133,18 @@ inline bool cpu_supports_feature(cpu_feature feature)
+       return true;
+ #endif // __ARM_NEON
+     case cpu_feature::pmull:
++#ifdef __linux__
+       return ::getauxval(AT_HWCAP) & HWCAP_PMULL;
++#elif defined(__APPLE__)
++    {
++      // Darwin exposes no auxiliary vector. The ARM feature flags are sysctl keys instead.
++      int    value = 0;
++      size_t len   = sizeof(value);
++      return ::sysctlbyname("hw.optional.arm.FEAT_PMULL", &value, &len, nullptr, 0) == 0 and value != 0;
++    }
++#else
++      return false;
++#endif
+ #endif // __aarch64__
+     default:
+       return false;
+-- 
+2.55.0
+

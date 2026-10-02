@@ -1,0 +1,64 @@
+From 7efcdb56e5a5303d69ca940b3fbb72186340eec7 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: build the perf_event RAPL reader on Linux only
+
+perf_event_powercap_reader_impl.cpp opens the RAPL PMU through
+perf_event_open(2), described by <linux/perf_event.h> and reached through
+<sys/syscall.h>. Both are Linux kernel interfaces with no counterpart on
+Darwin.
+
+Compile the reader on Linux only. Elsewhere build_perf_event_reader()
+reports the backend as unavailable and returns nullptr, so
+build_energy_consumption_reader() continues to the MSR reader and then to
+the dummy reader, exactly as it does on a Linux host without CAP_PERFMON.
+No functionality is lost for a development host.
+---
+ .../perf_event_powercap_reader_impl.cpp       | 21 ++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/lib/support/resource_usage/perf_event_powercap_reader_impl.cpp b/lib/support/resource_usage/perf_event_powercap_reader_impl.cpp
+index eeacee9..1f79123 100644
+--- a/lib/support/resource_usage/perf_event_powercap_reader_impl.cpp
++++ b/lib/support/resource_usage/perf_event_powercap_reader_impl.cpp
+@@ -2,15 +2,18 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "perf_event_powercap_reader_impl.h"
++
++using namespace ocudu;
++using namespace resource_usage_utils;
++
++#ifdef __linux__
++
+ #include <charconv>
+ #include <fstream>
+ #include <linux/perf_event.h>
+ #include <sstream>
+ #include <sys/syscall.h>
+ 
+-using namespace ocudu;
+-using namespace resource_usage_utils;
+-
+ static constexpr auto powercap_pmu_type_path   = "/sys/bus/event_source/devices/power/type";
+ static constexpr auto powercap_pkg_event_path  = "/sys/bus/event_source/devices/power/events/energy-pkg";
+ static constexpr auto powercap_pkg_scale_path  = "/sys/bus/event_source/devices/power/events/energy-pkg.scale";
+@@ -149,3 +152,15 @@ std::unique_ptr<energy_consumption_reader> resource_usage_utils::build_perf_even
+ 
+   return std::make_unique<perf_event_powercap_reader>(std::move(pkg_fd), pkg_scale, std::move(core_fd), core_scale);
+ }
++
++#else // __linux__
++
++/// perf_event_open(2) and the RAPL PMU are Linux kernel interfaces. On other platforms there is nothing to open, so the
++/// energy consumption reader falls through to the next backend, and finally to the dummy reader.
++std::unique_ptr<energy_consumption_reader> resource_usage_utils::build_perf_event_reader(ocudulog::basic_logger& logger)
++{
++  logger.debug("Energy consumption utils: perf RAPL PMU not available on this OS.");
++  return nullptr;
++}
++
++#endif // __linux__
+-- 
+2.55.0
+

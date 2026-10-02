@@ -1,0 +1,51 @@
+From 79b4421c55d5f98e3c28eb423327a2fffd53db5f Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] ocudulog: cast pthread_t through uintptr_t in the event
+ tracer
+
+pthread_t is an unsigned long on glibc and a pointer on Darwin, so the
+cast (unsigned)::pthread_self() is a narrowing cast from a pointer there
+and clang rejects it: "cast from pointer to smaller type 'unsigned int'
+loses information".
+
+Go through uintptr_t so the truncation is explicit. The value is only a
+trace identifier; losing the high half carries the same collision risk
+the original cast already had on 64-bit Linux.
+---
+ lib/ocudulog/event_trace.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/lib/ocudulog/event_trace.cpp b/lib/ocudulog/event_trace.cpp
+index f5a9e57..e54cbd3 100644
+--- a/lib/ocudulog/event_trace.cpp
++++ b/lib/ocudulog/event_trace.cpp
+@@ -4,6 +4,7 @@
+ #include "ocudu/ocudulog/event_trace.h"
+ #include "sinks/buffered_file_sink.h"
+ #include "ocudu/ocudulog/ocudulog.h"
++#include <cstdint>
+ #include <ctime>
+ 
+ #undef trace_duration_begin
+@@ -86,7 +87,7 @@ void trace_duration_begin(const std::string& category, const std::string& name)
+ 
+   char fmt_time[24];
+   format_time(fmt_time, sizeof(fmt_time));
+-  (*tracer)("[{}] [TID:{}] Entering \"{}\": {}", fmt_time, (unsigned)::pthread_self(), category, name);
++  (*tracer)("[{}] [TID:{}] Entering \"{}\": {}", fmt_time, (unsigned)(uintptr_t)::pthread_self(), category, name);
+ }
+ 
+ void trace_duration_end(const std::string& category, const std::string& name)
+@@ -97,7 +98,7 @@ void trace_duration_end(const std::string& category, const std::string& name)
+ 
+   char fmt_time[24];
+   format_time(fmt_time, sizeof(fmt_time));
+-  (*tracer)("[{}] [TID:{}] Leaving \"{}\": {}", fmt_time, (unsigned)::pthread_self(), category, name);
++  (*tracer)("[{}] [TID:{}] Leaving \"{}\": {}", fmt_time, (unsigned)(uintptr_t)::pthread_self(), category, name);
+ }
+ 
+ } // namespace ocudulog
+-- 
+2.55.0
+

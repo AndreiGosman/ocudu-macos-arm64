@@ -1,0 +1,44 @@
+From 8c24eca26890d3a1dbb87c39eb962110fa0abbfa Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] ocudulog: call htons without scope qualification
+
+htons is a function on glibc but a macro on Darwin, BSD and musl, where
+::htons(x) expands to ::__DARWIN_OSSwapInt16(x) and fails with "expected
+unqualified-id". POSIX specifies htons as a function that may also be a
+macro, so the qualified spelling is not portable. Drop the scope operator
+in the two places that use it, the UDP log sink and the OFH RU emulator.
+---
+ apps/examples/ofh/ru_emulator.cpp | 2 +-
+ lib/ocudulog/sinks/udp_sink.h     | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/apps/examples/ofh/ru_emulator.cpp b/apps/examples/ofh/ru_emulator.cpp
+index 1bcf36f..bda0cf5 100644
+--- a/apps/examples/ofh/ru_emulator.cpp
++++ b/apps/examples/ofh/ru_emulator.cpp
+@@ -202,7 +202,7 @@ static void set_static_header_params(span<uint8_t> frame, header_parameters para
+   std::memcpy(&frame[14], &net_bytes, sizeof(net_bytes));
+ 
+   // Set correct payload size.
+-  uint16_t payload_size = ::htons(params.payload_size);
++  uint16_t payload_size = htons(params.payload_size);
+   std::memcpy(&frame[20], &payload_size, sizeof(uint16_t));
+ 
+   // Set port ID.
+diff --git a/lib/ocudulog/sinks/udp_sink.h b/lib/ocudulog/sinks/udp_sink.h
+index f63652e..6fef6ca 100644
+--- a/lib/ocudulog/sinks/udp_sink.h
++++ b/lib/ocudulog/sinks/udp_sink.h
+@@ -34,7 +34,7 @@ public:
+ 
+       remote_address            = {};
+       remote_address.sin_family = AF_INET;
+-      remote_address.sin_port   = ::htons(port);
++      remote_address.sin_port   = htons(port);
+ 
+       // First treat remote_ip as an ip address.
+       if (::inet_pton(AF_INET, remote_ip.c_str(), &remote_address.sin_addr) == 1) {
+-- 
+2.55.0
+

@@ -1,0 +1,357 @@
+From f70d16fb33f3eab84b5333d18ee5d7193dba14f6 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:40:05 +0300
+Subject: [PATCH] support: emulate timerfd with kqueue and a pipe on Darwin
+
+io_timer_source creates a periodic timerfd and registers it in the
+io_broker, reading the expiration count out of the descriptor on every
+tick. Darwin has no timerfd and no POSIX interval timers, so neither
+timerfd_create nor itimerspec exists there.
+
+Add timerfd_compat.h/.cpp next to io_timer_source. On Linux the header is
+a drop-in for <sys/timerfd.h>. On Darwin a process-wide kqueue drives the
+timing with EVFILT_TIMER, one background thread waits on it, and each
+timer hands the caller the read end of a pipe into which the thread
+writes the expiration count. The descriptor is readable and pollable, so
+io_timer_source keeps its logic unchanged; only the include moves.
+
+Two details to know. Linux coalesces expirations into one read(); here
+each wake-up writes its own count, so a slow reader sees several
+eight-byte values whose sum is the same, which the tick loop handles.
+And because callers close the descriptor with plain close(), dead
+entries are reclaimed at the next timerfd_create, before pipe(), so a
+reused descriptor number cannot match a stale entry. The write end has
+F_SETNOSIGPIPE so a closed reader cannot kill the process.
+
+Same design as a prior srsRAN 4G Darwin port, verified there
+for periodic delivery through read(), one-shot delivery through poll(),
+disarm and timerfd_gettime.
+---
+ lib/support/CMakeLists.txt              |   1 +
+ lib/support/network/io_timer_source.cpp |   2 +-
+ lib/support/network/timerfd_compat.cpp  | 234 ++++++++++++++++++++++++
+ lib/support/network/timerfd_compat.h    |  46 +++++
+ 4 files changed, 282 insertions(+), 1 deletion(-)
+ create mode 100644 lib/support/network/timerfd_compat.cpp
+ create mode 100644 lib/support/network/timerfd_compat.h
+
+diff --git a/lib/support/CMakeLists.txt b/lib/support/CMakeLists.txt
+index 5b06527..197a010 100644
+--- a/lib/support/CMakeLists.txt
++++ b/lib/support/CMakeLists.txt
+@@ -22,6 +22,7 @@ set(SOURCES
+         network/io_broker_epoll.cpp
+         network/io_broker_factory.cpp
+         network/io_timer_source.cpp
++        network/timerfd_compat.cpp
+         network/sockets.cpp
+         network/transport_layer_address.cpp
+         synchronization/futex_util.cpp
+diff --git a/lib/support/network/io_timer_source.cpp b/lib/support/network/io_timer_source.cpp
+index 89e38e2..6f56448 100644
+--- a/lib/support/network/io_timer_source.cpp
++++ b/lib/support/network/io_timer_source.cpp
+@@ -6,7 +6,7 @@
+ #include "ocudu/support/error_handling.h"
+ #include "ocudu/support/io/io_broker.h"
+ #include "ocudu/support/timers.h"
+-#include <sys/timerfd.h>
++#include "timerfd_compat.h"
+ 
+ using namespace ocudu;
+ 
+diff --git a/lib/support/network/timerfd_compat.cpp b/lib/support/network/timerfd_compat.cpp
+new file mode 100644
+index 0000000..9081813
+--- /dev/null
++++ b/lib/support/network/timerfd_compat.cpp
+@@ -0,0 +1,234 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#include "timerfd_compat.h"
++
++#ifdef __APPLE__
++
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <mutex>
++#include <sys/event.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++namespace {
++
++/// One emulated timerfd: the pipe the caller reads and the pipe end the timer thread writes.
++struct tfd_entry {
++  int        rd_fd = -1;
++  int        wr_fd = -1;
++  itimerspec spec  = {};
++};
++
++/// Process-wide state: one kqueue, one thread, one table of live timers.
++class tfd_state
++{
++public:
++  static tfd_state& get()
++  {
++    static tfd_state st;
++    return st;
++  }
++
++  int create(int flags)
++  {
++    std::lock_guard<std::mutex> guard(lock);
++
++    if (kq < 0) {
++      kq = ::kqueue();
++      if (kq < 0) {
++        return -1;
++      }
++    }
++    // The caller closes its descriptor with plain close(), which cannot tell us the timer is finished. Reclaim dead
++    // entries before allocating, otherwise a reused descriptor number matches a stale slot and the timer thread writes
++    // into a pipe nobody reads. Must run before pipe(), so that live entries cannot collide with the descriptors we are
++    // about to get.
++    reap_locked();
++
++    int fds[2];
++    if (::pipe(fds) != 0) {
++      return -1;
++    }
++    // Writing from the timer thread must never raise SIGPIPE.
++    int on = 1;
++    ::fcntl(fds[1], F_SETNOSIGPIPE, on);
++    if (flags & TFD_NONBLOCK) {
++      ::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
++    }
++    if (flags & TFD_CLOEXEC) {
++      ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
++      ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
++    }
++
++    if (not started) {
++      std::thread(&tfd_state::thread_loop, this).detach();
++      started = true;
++    }
++
++    slots.push_back(tfd_entry{fds[0], fds[1], {}});
++    return fds[0];
++  }
++
++  int settime(int fd, int flags, const itimerspec* new_value, itimerspec* old_value)
++  {
++    if (new_value == nullptr) {
++      errno = EINVAL;
++      return -1;
++    }
++    {
++      std::lock_guard<std::mutex> guard(lock);
++      tfd_entry*                  entry = find_locked(fd);
++      if (entry == nullptr) {
++        errno = EINVAL;
++        return -1;
++      }
++      if (old_value != nullptr) {
++        *old_value = entry->spec;
++      }
++      entry->spec = *new_value;
++    }
++
++    const int64_t first_ns  = int64_t{new_value->it_value.tv_sec} * 1000000000 + new_value->it_value.tv_nsec;
++    const int64_t period_ns = int64_t{new_value->it_interval.tv_sec} * 1000000000 + new_value->it_interval.tv_nsec;
++
++    struct kevent ev;
++    // An it_value of zero disarms the timer, as on Linux.
++    if (first_ns == 0) {
++      EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
++      ::kevent(kq, &ev, 1, nullptr, 0, nullptr);
++      return 0;
++    }
++
++    uint32_t fflags  = NOTE_NSECONDS;
++    uint16_t evflags = EV_ADD | EV_ENABLE;
++    int64_t  data    = first_ns;
++    if (flags & TFD_TIMER_ABSTIME) {
++      fflags |= NOTE_ABSOLUTE;
++      evflags |= EV_ONESHOT;
++    } else if (period_ns == 0) {
++      evflags |= EV_ONESHOT;
++    } else {
++      // Periodic. kqueue repeats at the interval it is given, so arm it with the period. The first expiry differs from
++      // it_value only when the caller asks for a different initial delay, which io_timer_source does not do.
++      data = period_ns;
++    }
++    EV_SET(&ev, static_cast<uintptr_t>(fd), EVFILT_TIMER, evflags, fflags, data, nullptr);
++    return ::kevent(kq, &ev, 1, nullptr, 0, nullptr) == 0 ? 0 : -1;
++  }
++
++  int gettime(int fd, itimerspec* curr_value)
++  {
++    if (curr_value == nullptr) {
++      errno = EFAULT;
++      return -1;
++    }
++    std::lock_guard<std::mutex> guard(lock);
++    tfd_entry*                  entry = find_locked(fd);
++    if (entry == nullptr) {
++      errno = EINVAL;
++      return -1;
++    }
++    *curr_value = entry->spec;
++    return 0;
++  }
++
++private:
++  tfd_entry* find_locked(int fd)
++  {
++    for (tfd_entry& e : slots) {
++      if (e.rd_fd == fd) {
++        return &e;
++      }
++    }
++    return nullptr;
++  }
++
++  void drop_locked(std::vector<tfd_entry>::iterator it)
++  {
++    struct kevent del;
++    EV_SET(&del, static_cast<uintptr_t>(it->rd_fd), EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
++    ::kevent(kq, &del, 1, nullptr, 0, nullptr);
++    ::close(it->wr_fd);
++    slots.erase(it);
++  }
++
++  void reap_locked()
++  {
++    for (auto it = slots.begin(); it != slots.end();) {
++      if (::fcntl(it->rd_fd, F_GETFD) >= 0) {
++        ++it; // still open
++        continue;
++      }
++      drop_locked(it);
++    }
++  }
++
++  void thread_loop()
++  {
++    for (;;) {
++      struct kevent ev;
++      const int     n = ::kevent(kq, nullptr, 0, &ev, 1, nullptr);
++      if (n < 0) {
++        if (errno == EINTR) {
++          continue;
++        }
++        return;
++      }
++      if (n == 0) {
++        continue;
++      }
++
++      const int      fd    = static_cast<int>(ev.ident);
++      const uint64_t count = ev.data > 0 ? static_cast<uint64_t>(ev.data) : 1;
++      int            wr    = -1;
++      {
++        std::lock_guard<std::mutex> guard(lock);
++        if (tfd_entry* entry = find_locked(fd)) {
++          wr = entry->wr_fd;
++        }
++      }
++      if (wr < 0) {
++        continue;
++      }
++      // A closed read end means the caller is gone. Drop the timer rather than spinning on a broken pipe.
++      if (::write(wr, &count, sizeof(count)) < 0 and (errno == EPIPE or errno == EBADF)) {
++        std::lock_guard<std::mutex> guard(lock);
++        for (auto it = slots.begin(); it != slots.end(); ++it) {
++          if (it->rd_fd == fd and it->wr_fd == wr) {
++            drop_locked(it);
++            break;
++          }
++        }
++      }
++    }
++  }
++
++  int                    kq      = -1;
++  bool                   started = false;
++  std::mutex             lock;
++  std::vector<tfd_entry> slots;
++};
++
++} // namespace
++
++extern "C" int timerfd_create(int /* clockid */, int flags)
++{
++  // kqueue timers are monotonic, whichever clock the caller names.
++  return tfd_state::get().create(flags);
++}
++
++extern "C" int timerfd_settime(int fd, int flags, const struct itimerspec* new_value, struct itimerspec* old_value)
++{
++  return tfd_state::get().settime(fd, flags, new_value, old_value);
++}
++
++extern "C" int timerfd_gettime(int fd, struct itimerspec* curr_value)
++{
++  return tfd_state::get().gettime(fd, curr_value);
++}
++
++#endif // __APPLE__
+diff --git a/lib/support/network/timerfd_compat.h b/lib/support/network/timerfd_compat.h
+new file mode 100644
+index 0000000..a0aacf7
+--- /dev/null
++++ b/lib/support/network/timerfd_compat.h
+@@ -0,0 +1,46 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++/// \file
++/// \brief timerfd for Darwin, backed by kqueue.
++///
++/// Darwin has no timerfd and no POSIX interval timers. kqueue EVFILT_TIMER is the native equivalent and drives the
++/// timing here, but a kqueue descriptor cannot be read(): it only reports readiness. io_timer_source reads the
++/// expiration count out of the descriptor, so the descriptor handed back is the read end of a pipe. One background
++/// thread waits on the kqueue and writes the count into the matching pipe. The result behaves like a timerfd for both
++/// read() and the io_broker, and close() is the ordinary system call.
++///
++/// Divergence to know: Linux coalesces expirations, so one read() returns every expiration since the previous read.
++/// Here each kevent wake-up writes its own count, so a slow reader gets several eight-byte values whose sum is the
++/// same, which is what the tick accounting in io_timer_source needs.
++///
++/// On Linux this header is a drop-in for <sys/timerfd.h>.
++
++#ifdef __APPLE__
++
++#include <fcntl.h>
++#include <time.h>
++
++/// Darwin has no POSIX interval timers and therefore no itimerspec. It is a pair of timespec, as POSIX defines it.
++struct itimerspec {
++  struct timespec it_interval;
++  struct timespec it_value;
++};
++
++#define TFD_CLOEXEC O_CLOEXEC
++#define TFD_NONBLOCK O_NONBLOCK
++#define TFD_TIMER_ABSTIME 1
++
++extern "C" {
++int timerfd_create(int clockid, int flags);
++int timerfd_settime(int fd, int flags, const struct itimerspec* new_value, struct itimerspec* old_value);
++int timerfd_gettime(int fd, struct itimerspec* curr_value);
++}
++
++#else // __APPLE__
++
++#include <sys/timerfd.h>
++
++#endif // __APPLE__
+-- 
+2.55.0
+

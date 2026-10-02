@@ -1,0 +1,81 @@
+From 53f4d4501a2086fe54ac09838e5f6b0f5d25337a Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: implement futex_util with os_sync_wait_on_address on
+ Darwin
+
+futex_util wraps the Linux futex syscall for sync_event and stop_event,
+which sit under every executor shutdown. Darwin has no futex. Since macOS
+14.4 it has os_sync_wait_on_address() and os_sync_wake_by_address_all(),
+which give the same contract: sleep only while the 32-bit word still
+holds the expected value, wake every waiter on that address, and let the
+caller re-check after a spurious wake-up.
+
+Select the implementation per platform. The Darwin wait maps the
+"remaining waiters" success value to 0 and the wake maps -1/ENOENT, which
+means no waiter was blocked, to 0, so the callers see the futex return
+convention on both systems. Other platforms fail at compile time with a
+clear message instead of at link time.
+---
+ lib/support/synchronization/futex_util.cpp | 26 ++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/lib/support/synchronization/futex_util.cpp b/lib/support/synchronization/futex_util.cpp
+index edf0694..3b4bc47 100644
+--- a/lib/support/synchronization/futex_util.cpp
++++ b/lib/support/synchronization/futex_util.cpp
+@@ -2,25 +2,51 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "ocudu/support/synchronization/futex_util.h"
++
++#if defined(__linux__)
+ #include <linux/futex.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
++#elif defined(__APPLE__)
++#include <cerrno>
++#include <os/os_sync_wait_on_address.h>
++#else
++#error "futex_util has no implementation for this platform"
++#endif
+ 
+ using namespace ocudu;
+ 
+ long futex_util::wait(std::atomic<uint32_t>& state, uint32_t expected)
+ {
++#if defined(__linux__)
+   // The kernel will only sleep if *addr == expected; otherwise returns -1/EAGAIN.
+   // Note: Futex requires int*.
+   // Note: No C++ aliasing is happening, as the kernel will just copy the uint32 bytes.
+   auto* addr = reinterpret_cast<int*>(&state);
+   return ::syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
++#else
++  // os_sync_wait_on_address (macOS 14.4+) sleeps only while *addr == expected, like FUTEX_WAIT. It returns the
++  // number of remaining waiters on success and -1 with errno on error or spurious wake-up (EINTR), which the callers
++  // handle by re-checking their condition, as with a futex.
++  const int ret = ::os_sync_wait_on_address(&state, expected, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
++  return ret < 0 ? -1 : 0;
++#endif
+ }
+ 
+ long futex_util::wake_all(std::atomic<uint32_t>& state)
+ {
++#if defined(__linux__)
+   // Note: Futex requires int*.
+   // Note: No C++ aliasing is happening, as the kernel will just copy the uint32 bytes.
+   auto* addr = reinterpret_cast<int*>(&state);
+   return ::syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
++#else
++  // A futex wake with no waiters returns 0. os_sync_wake_by_address_all reports that case as -1/ENOENT; map it back
++  // so the callers see the same contract on both systems.
++  const int ret = ::os_sync_wake_by_address_all(&state, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
++  if (ret < 0 and errno == ENOENT) {
++    return 0;
++  }
++  return ret;
++#endif
+ }
+-- 
+2.55.0
+

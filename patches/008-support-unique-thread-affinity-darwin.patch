@@ -1,0 +1,92 @@
+From a3db967a238d7b047ec5bcc5b3b7d436cfe3ef3b Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: build unique_thread without Linux affinity calls on
+ Darwin
+
+unique_thread.cpp pins threads with CPU_ALLOC, CPU_SET_S and
+pthread_setaffinity_np, reports the mask with pthread_getaffinity_np, and
+names the thread with the two-argument pthread_setname_np. All of these
+are glibc spellings. Darwin has no API that pins a thread to a CPU mask
+(thread_policy_set with THREAD_AFFINITY_POLICY is an advisory tag), and
+its pthread_setname_np names only the calling thread and takes no thread
+argument.
+
+Keep the Linux code as is and compile a Darwin branch next to it: an
+affinity request prints a warning and returns false, so a caller asking
+for a specific core is not told it succeeded; the affinity report says it
+is unavailable; and the thread is named with the one-argument form, which
+is what the code wants anyway since it always names pthread_self().
+Scheduling priority through pthread_setschedparam is untouched: SCHED_FIFO
+exists on Darwin, without a real-time guarantee.
+---
+ lib/support/executors/unique_thread.cpp | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/lib/support/executors/unique_thread.cpp b/lib/support/executors/unique_thread.cpp
+index 86cd17e..0afec6a 100644
+--- a/lib/support/executors/unique_thread.cpp
++++ b/lib/support/executors/unique_thread.cpp
+@@ -37,6 +37,14 @@ static bool thread_set_affinity(::pthread_t t, const os_sched_affinity_bitmask&
+                  span<const size_t>(invalid_ids));
+   }
+ 
++#ifndef __linux__
++  // Darwin has no API that pins a thread to a CPU mask: thread_policy_set with THREAD_AFFINITY_POLICY is an
++  // advisory tag without a mask. Drop the request rather than report a success that did not happen.
++  (void)t;
++  fmt::println("Warning: CPU affinity of thread \"{}\" not set. Cause: Thread affinity is not supported on this OS.",
++               name);
++  return false;
++#else
+   ::cpu_set_t* cpusetp     = CPU_ALLOC(bitmap.size());
+   size_t       cpuset_size = CPU_ALLOC_SIZE(bitmap.size());
+   CPU_ZERO_S(cpuset_size, cpusetp);
+@@ -56,6 +64,7 @@ static bool thread_set_affinity(::pthread_t t, const os_sched_affinity_bitmask&
+ 
+   CPU_FREE(cpusetp);
+   return true;
++#endif
+ }
+ 
+ static std::string compute_this_thread_name()
+@@ -78,10 +87,11 @@ static void print_thread_priority(::pthread_t t, const char* tname, std::thread:
+     return;
+   }
+ 
+-  ::cpu_set_t cpuset;
+-
+   int s;
+ 
++#ifdef __linux__
++  ::cpu_set_t cpuset;
++
+   s = ::pthread_getaffinity_np(t, sizeof(::cpu_set_t), &cpuset);
+   if (s != 0) {
+     fmt::println("error pthread_getaffinity_np: {}", ::strerror(s));
+@@ -93,6 +103,9 @@ static void print_thread_priority(::pthread_t t, const char* tname, std::thread:
+       fmt::println("    CPU {}", j);
+     }
+   }
++#else
++  fmt::println("Thread affinity is not available on this OS.");
++#endif
+ 
+   int           policy;
+   ::sched_param param;
+@@ -266,7 +279,12 @@ std::thread unique_thread::make_thread(const std::string&               name,
+     }
+ 
+     ::pthread_t tself = ::pthread_self();
++#ifdef __APPLE__
++    // Darwin names only the calling thread and takes no thread argument.
++    if (::pthread_setname_np(fixed_name.c_str()) != 0) {
++#else
+     if (::pthread_setname_np(tself, fixed_name.c_str()) != 0) {
++#endif
+       ::perror("pthread_setname_np");
+       fmt::println("Thread [{}]: Error while setting thread name to {}.", std::this_thread::get_id(), name);
+     }
+-- 
+2.55.0
+

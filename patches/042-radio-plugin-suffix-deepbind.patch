@@ -1,0 +1,45 @@
+From a60bd5a9aa3af37b3cf8ab9b31ed266412908723 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] radio: load RF plugins with the platform's shared library
+ suffix and without RTLD_DEEPBIND where absent
+
+create_plugin_radio_factory() opens libocudu_radio_<driver>.so with
+RTLD_DEEPBIND. The suffix is .dylib on Darwin and RTLD_DEEPBIND is a
+glibc extension that Darwin's dlfcn.h does not declare, so the file did
+not compile there. Pick the suffix per platform and add RTLD_DEEPBIND
+only where it is defined; on Darwin the two-level namespace already
+keeps a plugin's symbols separate. The radio drivers built into the
+tree (UHD, ZeroMQ) do not go through this path.
+---
+ lib/radio/plugin_radio_factory.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/lib/radio/plugin_radio_factory.cpp b/lib/radio/plugin_radio_factory.cpp
+index 1e2540e..88277da 100644
+--- a/lib/radio/plugin_radio_factory.cpp
++++ b/lib/radio/plugin_radio_factory.cpp
+@@ -102,9 +102,18 @@ private:
+ std::unique_ptr<radio_factory> ocudu::create_plugin_radio_factory(std::string driver_name)
+ {
+   char*       err         = nullptr;
++#ifdef __APPLE__
++  std::string plugin_name = "libocudu_radio_" + driver_name + ".dylib";
++#else
+   std::string plugin_name = "libocudu_radio_" + driver_name + ".so";
+-
+-  void* dl_handle = ::dlopen(plugin_name.c_str(), RTLD_NOW + RTLD_DEEPBIND + RTLD_GLOBAL);
++#endif
++
++  // RTLD_DEEPBIND is a glibc extension; Darwin's two-level namespace gives every library its own symbol scope anyway.
++  int dl_flags = RTLD_NOW | RTLD_GLOBAL;
++#ifdef RTLD_DEEPBIND
++  dl_flags |= RTLD_DEEPBIND;
++#endif
++  void* dl_handle = ::dlopen(plugin_name.c_str(), dl_flags);
+   if (dl_handle == nullptr) {
+     err = ::dlerror();
+     if (err != nullptr) {
+-- 
+2.55.0
+

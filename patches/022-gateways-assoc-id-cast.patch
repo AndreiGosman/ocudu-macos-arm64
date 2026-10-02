@@ -1,0 +1,36 @@
+From 9cf5b4e2879e35b75cc098a69f2c228f292c3681 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:23:08 +0300
+Subject: [PATCH] gateways: cast the association id explicitly where
+ sctp_assoc_t is unsigned
+
+sctp_network_server_impl keeps the association id as an int and passes it
+into dtls_ssl_config's sctp_assoc_t member through brace initialisation.
+lksctp types sctp_assoc_t as a signed 32-bit integer, so that is not a
+narrowing on Linux. RFC 6458, FreeBSD and usrsctp type it as uint32_t,
+which is what the libsctp-compat header on macOS declares, and clang then
+rejects the int to unsigned conversion in an initializer list under
+-Wc++11-narrowing.
+
+Make the conversion explicit. The value is the same on both systems.
+---
+ lib/gateways/sctp_network_server_impl.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/lib/gateways/sctp_network_server_impl.cpp b/lib/gateways/sctp_network_server_impl.cpp
+index 99b592d..28e5e10 100644
+--- a/lib/gateways/sctp_network_server_impl.cpp
++++ b/lib/gateways/sctp_network_server_impl.cpp
+@@ -619,7 +619,8 @@ void sctp_network_server_impl::handle_sctp_comm_up(const struct sctp_assoc_chang
+     addr.set_port(0); // Ignore port from peer.
+     auto      mode_it = node_cfg.dtls_cfg->mode_map.find(addr);
+     dtls_mode mode    = (mode_it != node_cfg.dtls_cfg->mode_map.end()) ? mode_it->second : node_cfg.dtls_cfg->mode;
+-    assoc_ctxt.ssl    = create_dtls_ssl(dtls_ssl_config{mode, assoc_ctxt.assoc_id}, {*dtls_ctxt, *this});
++    assoc_ctxt.ssl =
++        create_dtls_ssl(dtls_ssl_config{mode, static_cast<sctp_assoc_t>(assoc_ctxt.assoc_id)}, {*dtls_ctxt, *this});
+     if (not assoc_ctxt.ssl->init(assoc_ctxt.fd)) {
+       logger.error("{} assoc={}: Could not initialize DTLS context for new association", node_cfg.if_name, assoc_id);
+       /// Remove association as if it was lost. Do it directly, as we are running in the app executor already.
+-- 
+2.55.0
+

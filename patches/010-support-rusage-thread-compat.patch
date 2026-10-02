@@ -1,0 +1,155 @@
+From af07a8c7a26d116a798d2284e94ec52206ecce85 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:35:53 +0300
+Subject: [PATCH] support: read per-thread rusage through a wrapper that Darwin
+ can serve
+
+resource_usage_utils.h types its selector enum with __rusage_who_t and
+both resource_usage_utils.cpp and tracing/resource_usage.cpp call
+getrusage(RUSAGE_THREAD). The type and the selector are glibc
+extensions; Darwin has neither, and its per-thread CPU times live in
+Mach thread_info() instead.
+
+Add ocudu/support/os/rusage_compat.h with getrusage_compat(int who,
+rusage*). On Linux it forwards to getrusage() with the glibc enum cast.
+On Darwin it defines RUSAGE_THREAD as the Linux value 1, which clashes
+with neither RUSAGE_SELF (0) nor RUSAGE_CHILDREN (-1), and serves it from
+THREAD_BASIC_INFO: user and system time are reported, the context switch
+counters are not available per thread there and stay zero. The selector
+enum is typed as int, which is what both getrusage() variants accept.
+---
+ include/ocudu/support/os/rusage_compat.h      | 60 +++++++++++++++++++
+ .../resource_usage/resource_usage_utils.h     |  4 +-
+ .../resource_usage/resource_usage_utils.cpp   |  2 +-
+ lib/support/tracing/resource_usage.cpp        |  4 +-
+ 4 files changed, 65 insertions(+), 5 deletions(-)
+ create mode 100644 include/ocudu/support/os/rusage_compat.h
+
+diff --git a/include/ocudu/support/os/rusage_compat.h b/include/ocudu/support/os/rusage_compat.h
+new file mode 100644
+index 0000000..d62ed61
+--- /dev/null
++++ b/include/ocudu/support/os/rusage_compat.h
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: Copyright (C) 2021-2026 Software Radio Systems Limited
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++/// \file
++/// \brief getrusage() with the Linux RUSAGE_THREAD selector, provided on Darwin.
++///
++/// RUSAGE_THREAD and the __rusage_who_t type are glibc extensions. Darwin's getrusage() knows RUSAGE_SELF (0) and
++/// RUSAGE_CHILDREN (-1) only, and the per-thread CPU times live in Mach thread_info(). This header gives callers one
++/// spelling for both systems.
++
++#include <sys/resource.h>
++
++#ifdef __APPLE__
++#include <cerrno>
++#include <cstring>
++#include <mach/mach.h>
++
++/// Linux value, distinct from RUSAGE_SELF (0) and RUSAGE_CHILDREN (-1) on Darwin.
++#ifndef RUSAGE_THREAD
++#define RUSAGE_THREAD 1
++#endif
++#endif // __APPLE__
++
++namespace ocudu {
++
++/// \brief getrusage() that also accepts RUSAGE_THREAD on Darwin.
++///
++/// On Darwin the thread selector is served from Mach THREAD_BASIC_INFO, which reports user and system time. The
++/// context switch counters are not available per thread there and stay zero.
++inline int getrusage_compat(int who, ::rusage* usage)
++{
++#ifdef __APPLE__
++  if (who == RUSAGE_THREAD) {
++    thread_basic_info_data_t  info;
++    mach_msg_type_number_t    count  = THREAD_BASIC_INFO_COUNT;
++    const mach_port_t         thread = ::mach_thread_self();
++    const kern_return_t       kr     = ::thread_info(thread, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count);
++    ::mach_port_deallocate(::mach_task_self(), thread);
++    if (kr != KERN_SUCCESS) {
++      errno = EINVAL;
++      return -1;
++    }
++    std::memset(usage, 0, sizeof(*usage));
++    usage->ru_utime.tv_sec  = info.user_time.seconds;
++    usage->ru_utime.tv_usec = info.user_time.microseconds;
++    usage->ru_stime.tv_sec  = info.system_time.seconds;
++    usage->ru_stime.tv_usec = info.system_time.microseconds;
++    return 0;
++  }
++  return ::getrusage(who, usage);
++#elif defined(__GLIBC__)
++  return ::getrusage(static_cast<__rusage_who_t>(who), usage);
++#else
++  return ::getrusage(who, usage);
++#endif
++}
++
++} // namespace ocudu
+diff --git a/include/ocudu/support/resource_usage/resource_usage_utils.h b/include/ocudu/support/resource_usage/resource_usage_utils.h
+index c365798..a7491ef 100644
+--- a/include/ocudu/support/resource_usage/resource_usage_utils.h
++++ b/include/ocudu/support/resource_usage/resource_usage_utils.h
+@@ -5,8 +5,8 @@
+ 
+ #include "ocudu/adt/expected.h"
+ #include "ocudu/support/resource_usage/resource_usage_metrics.h"
++#include "ocudu/support/os/rusage_compat.h"
+ #include <chrono>
+-#include <sys/resource.h>
+ 
+ namespace ocudu {
+ namespace resource_usage_utils {
+@@ -15,7 +15,7 @@ using rusage_meas_clock      = std::chrono::steady_clock;
+ using rusage_meas_time_point = rusage_meas_clock::time_point;
+ using rusage_meas_duration   = std::chrono::nanoseconds;
+ 
+-enum class rusage_measurement_type : __rusage_who_t { THREAD = RUSAGE_THREAD, PROCESS = RUSAGE_SELF, NONE };
++enum class rusage_measurement_type : int { THREAD = RUSAGE_THREAD, PROCESS = RUSAGE_SELF, NONE };
+ 
+ /// Used to store the CPU time used by a thread or process, as well as process's memory usage.
+ struct measurements {
+diff --git a/lib/support/resource_usage/resource_usage_utils.cpp b/lib/support/resource_usage/resource_usage_utils.cpp
+index a01c974..97565fa 100644
+--- a/lib/support/resource_usage/resource_usage_utils.cpp
++++ b/lib/support/resource_usage/resource_usage_utils.cpp
+@@ -62,7 +62,7 @@ static cpu_snapshot to_snapshot(const ::rusage& rusg)
+ expected<cpu_snapshot, int> resource_usage_utils::cpu_usage_now(rusage_measurement_type type)
+ {
+   ::rusage ret;
+-  if (::getrusage(static_cast<__rusage_who_t>(type), &ret) == 0) {
++  if (getrusage_compat(static_cast<int>(type), &ret) == 0) {
+     return to_snapshot(ret);
+   }
+   return make_unexpected(errno);
+diff --git a/lib/support/tracing/resource_usage.cpp b/lib/support/tracing/resource_usage.cpp
+index 9ddfce7..8b7fcb0 100644
+--- a/lib/support/tracing/resource_usage.cpp
++++ b/lib/support/tracing/resource_usage.cpp
+@@ -2,8 +2,8 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Open-MPI
+ 
+ #include "ocudu/support/tracing/resource_usage.h"
++#include "ocudu/support/os/rusage_compat.h"
+ #include <cerrno>
+-#include <sys/resource.h>
+ 
+ using namespace ocudu;
+ using namespace resource_usage;
+@@ -21,7 +21,7 @@ static snapshot rusage_to_snapshot(const ::rusage& rusg)
+ ocudu::expected<snapshot, int> ocudu::resource_usage::now()
+ {
+   ::rusage ret;
+-  if (::getrusage(RUSAGE_THREAD, &ret) == 0) {
++  if (getrusage_compat(RUSAGE_THREAD, &ret) == 0) {
+     return rusage_to_snapshot(ret);
+   }
+   return make_unexpected(errno);
+-- 
+2.55.0
+

@@ -1,0 +1,35 @@
+From cda555f59d4ec3cc422a211b1edd95c84e0b51fa Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:40:05 +0300
+Subject: [PATCH] support: name SOCK_DCCP and SOCK_PACKET only where they exist
+
+sock_type_to_str() lists SOCK_DCCP and SOCK_PACKET, two Linux-only socket
+types that Darwin's <sys/socket.h> does not define. Guard the two cases
+so the function compiles on both systems; on Darwin those values can
+never be returned by socket() anyway.
+---
+ lib/support/network/sockets.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/lib/support/network/sockets.cpp b/lib/support/network/sockets.cpp
+index 123d29b..f4f949f 100644
+--- a/lib/support/network/sockets.cpp
++++ b/lib/support/network/sockets.cpp
+@@ -159,10 +159,14 @@ std::string ocudu::sock_type_to_str(int type)
+       return "SOCK_RDM";
+     case SOCK_SEQPACKET:
+       return "SOCK_SEQPACKET";
++#ifdef SOCK_DCCP
+     case SOCK_DCCP:
+       return "SOCK_DCCP";
++#endif
++#ifdef SOCK_PACKET
+     case SOCK_PACKET:
+       return "SOCK_PACKET";
++#endif
+   }
+   return "unknown type";
+ }
+-- 
+2.55.0
+

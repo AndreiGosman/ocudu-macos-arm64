@@ -1,0 +1,56 @@
+From 8dcfc1b6357d3a56f9cd712d8057fdd2012ec017 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 09:29:19 +0300
+Subject: [PATCH] phy: print uint64_t with PRIx64 in the ARM crypto probe
+
+The HAVE_ARM_CRYPTO probe in lib/phy/upper/channel_coding/CMakeLists.txt
+is compiled with the project CMAKE_CXX_FLAGS, which carry -Wall -Werror
+by default. It prints the vmull_p64 result, a uint64_t, with %016lx. On
+Linux uint64_t is unsigned long and the conversion matches. On Darwin
+uint64_t is unsigned long long, so clang reports
+
+  error: format specifies type 'unsigned long' but the argument has type
+  'uint64_t' (aka 'unsigned long long') [-Werror,-Wformat]
+
+and the probe fails for a reason unrelated to the crypto extension. The
+fallback probe with -march=native+crypto uses the same source and fails
+the same way, so configure stops with "AppleClang does not support
++crypto feature" on a core that has it.
+
+Use PRIx64 from <inttypes.h>, which is correct on both ABIs, and drop the
+duplicated <arm_neon.h> include.
+---
+ lib/phy/upper/channel_coding/CMakeLists.txt | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/lib/phy/upper/channel_coding/CMakeLists.txt b/lib/phy/upper/channel_coding/CMakeLists.txt
+index 998adbb..bfa9058 100644
+--- a/lib/phy/upper/channel_coding/CMakeLists.txt
++++ b/lib/phy/upper/channel_coding/CMakeLists.txt
+@@ -16,9 +16,13 @@ if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+ 
+     # Check if polynomial multiplication is available with the current compiler flags.
+     include(CheckCXXCompilerFlag)
++    # The probe is compiled with the project flags, including -Werror. Print the
++    # uint64_t with PRIx64: on Darwin uint64_t is unsigned long long, and a
++    # %lx conversion fails -Wformat there, which made the probe report a
++    # missing crypto extension on every Apple Silicon host.
+     set(CHECK_ARM_CRYPTO_CODE "
+         #include <arm_neon.h>
+-        #include <arm_neon.h>
++        #include <inttypes.h>
+         #include <stdio.h>
+ 
+         int main() {
+@@ -26,7 +30,7 @@ if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+             uint64_t b = 0xfedcba9876543210;
+             uint64x2_t result = vreinterpretq_u64_p128(vmull_p64(a, b));
+ 
+-            printf(\"Result: 0x%016lx\", vgetq_lane_u64(result, 0));
++            printf(\"Result: 0x%016\" PRIx64, vgetq_lane_u64(result, 0));
+             return 0;
+         }")
+     check_cxx_source_compiles("${CHECK_ARM_CRYPTO_CODE}" HAVE_ARM_CRYPTO)
+-- 
+2.55.0
+

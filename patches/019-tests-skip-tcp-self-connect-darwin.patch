@@ -1,0 +1,39 @@
+From fe4a67ca86767c3c37f1e83384459c739977f378 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 11:49:29 +0300
+Subject: [PATCH] tests: skip the TCP self-connect io_broker case on Darwin
+
+af_inet_socket_tcp_trx_test connects a bound, non-listening TCP socket to
+its own address and then sends to itself. Linux completes that as a TCP
+simultaneous open, so one descriptor serves as both ends. Darwin rejects
+the connect() with EINVAL; the test then fails every send() assertion and
+blocks forever in the condition variable wait, which also keeps the rest
+of the suite from running.
+
+Skip the case on Darwin with GTEST_SKIP and say why. The UDP and Unix
+domain cases of the same fixture cover descriptor dispatch, and a stream
+socket obtained through listen()/accept() behaves the same in the broker;
+a fixture built that way would make this case portable.
+---
+ tests/unittests/support/network/io_broker_epoll_test.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tests/unittests/support/network/io_broker_epoll_test.cpp b/tests/unittests/support/network/io_broker_epoll_test.cpp
+index 1d952d9..9a8a047 100644
+--- a/tests/unittests/support/network/io_broker_epoll_test.cpp
++++ b/tests/unittests/support/network/io_broker_epoll_test.cpp
+@@ -222,6 +222,11 @@ TEST_F(io_broker_epoll, af_inet_socket_udp_trx_test)
+ 
+ TEST_F(io_broker_epoll, af_inet_socket_tcp_trx_test)
+ {
++#ifdef __APPLE__
++  // The fixture connects a bound, non-listening TCP socket to itself, which Linux completes as a simultaneous open.
++  // Darwin rejects the self-connect with EINVAL, so the stream path cannot be exercised this way there.
++  GTEST_SKIP() << "TCP self-connect is not supported on Darwin";
++#endif
+   create_af_init_sockets(SOCK_STREAM);
+   add_socket_to_epoll();
+   run_tx_rx_test();
+-- 
+2.55.0
+

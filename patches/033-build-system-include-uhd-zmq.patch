@@ -1,0 +1,45 @@
+From 51a843e9216ddf2616fedd22aa13b8e7303fa646 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:40 +0300
+Subject: [PATCH] build: add the UHD and ZeroMQ include directories as system
+ directories
+
+The UHD and ZeroMQ include directories were added with plain
+include_directories(), so their headers, and the Boost headers UHD pulls
+in, are compiled with the project's -Wall -Wshadow -Wsuggest-override
+under -Werror. On a host where that directory is a package prefix,
+Homebrew's /opt/homebrew/include on macOS, Boost's graph and format
+headers fail the build with warnings the project cannot fix.
+
+Mark both as SYSTEM, which is what the tree already does for DPDK.
+Warnings in third-party headers are then suppressed, as the compiler
+does for /usr/include on Linux.
+---
+ CMakeLists.txt | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 204998c..8b99b3a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -541,7 +541,7 @@ find_package(Threads REQUIRED)
+ if (ENABLE_UHD)
+     find_package(UHD)
+     if (UHD_FOUND)
+-        include_directories(${UHD_INCLUDE_DIRS})
++        include_directories(SYSTEM ${UHD_INCLUDE_DIRS})
+         link_directories(${UHD_LIBRARY_DIRS})
+         sbom_add(
+             PACKAGE            "UHD"
+@@ -589,7 +589,7 @@ endif (ENABLE_SIDEKIQ)
+ if (ENABLE_ZEROMQ)
+     find_package(ZeroMQ)
+     if (ZEROMQ_FOUND)
+-        include_directories(${ZEROMQ_INCLUDE_DIRS})
++        include_directories(SYSTEM ${ZEROMQ_INCLUDE_DIRS})
+         link_directories(${ZEROMQ_LIBRARY_DIRS})
+         sbom_add(
+             PACKAGE            "ZeroMQ"
+-- 
+2.55.0
+

@@ -1,0 +1,50 @@
+From 2a13c0cccba047ab07ba5a77ad88ab4e39fc03bf Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 09:27:52 +0300
+Subject: [PATCH] build: treat CMAKE_SYSTEM_PROCESSOR arm64 as aarch64
+
+Darwin reports the 64-bit ARM processor as "arm64" where Linux reports
+"aarch64". Every architecture test in this tree matches "aarch64": the
+-mcpu selection in the top-level CMakeLists.txt, the ARM Performance
+Libraries lookup, and the NEON source lists in lib/phy/upper/channel_coding,
+lib/phy/upper/channel_coding/ldpc, lib/phy/upper/channel_modulation,
+lib/phy/generic_functions/precoding and lib/ofh/compression.
+
+The factories pick those NEON implementations at compile time under
+__ARM_NEON, which the compiler defines on every 64-bit ARM target, so an
+arm64 host configured the x86 -march branch and compiled factories that
+reference NEON classes whose sources were never added to the build.
+
+Map arm64 to aarch64 once, right after project(), so that every
+subdirectory sees the same processor string. On Apple clang 21
+-mcpu=native then resolves to the host core (apple-m4 on the machine
+this was written on).
+---
+ CMakeLists.txt | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fd9399c..d36772e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,17 @@ endif (${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
+ cmake_minimum_required(VERSION 3.14)
+ project(ocudu)
+ 
++# Darwin reports the 64-bit ARM processor as "arm64" where Linux reports
++# "aarch64". Every architecture test in this tree matches "aarch64": the -mcpu
++# selection below, the ARM Performance Libraries lookup, and the NEON source
++# lists in lib/phy and lib/ofh. The factories select those NEON implementations
++# at compile time under __ARM_NEON regardless of the CMake string, so an arm64
++# host would get the x86 -march branch and NEON factories without NEON sources.
++# Normalise once here so that every subdirectory sees the same string.
++if (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
++    set(CMAKE_SYSTEM_PROCESSOR "aarch64")
++endif ()
++
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+-- 
+2.55.0
+

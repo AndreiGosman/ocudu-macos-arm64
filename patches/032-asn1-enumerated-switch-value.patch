@@ -1,0 +1,85 @@
+From 55344a3a625f327dc21c598836f331692d6cd231 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:40 +0300
+Subject: [PATCH] asn1: switch on the enumerator value in the templated choice
+ types
+
+setup_release_c<T> and the other templated CHOICE helper in asn1_utils.h
+switch on type_, an enumerated<> object, and label the cases with the
+enumerators of its options type. Inside a class template the condition
+is type dependent, and Apple clang 21 checks the non-dependent case
+labels at definition time against the class type of the condition
+instead of its contextually converted enumeration type: the labels are
+converted through enumerated's constructor and rejected as "case value is
+not a constant expression". Every translation unit that includes the
+header reports the six labels, 3048 errors in a gNB build. GCC 16 and
+the non-templated generated choices, where the condition is not
+dependent, are unaffected.
+
+Switch on type_.value, the enumerator itself. Same semantics, no
+conversion involved, and the generated code is untouched.
+---
+ include/ocudu/asn1/asn1_utils.h | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/include/ocudu/asn1/asn1_utils.h b/include/ocudu/asn1/asn1_utils.h
+index 4d6e11b..688c8c2 100644
+--- a/include/ocudu/asn1/asn1_utils.h
++++ b/include/ocudu/asn1/asn1_utils.h
+@@ -1718,7 +1718,7 @@ struct setup_release_c {
+   OCUDUASN_CODE pack(bit_ref& bref) const
+   {
+     type_.pack(bref);
+-    switch (type_) {
++    switch (type_.value) {
+       case types::release:
+         break;
+       case types::setup:
+@@ -1735,7 +1735,7 @@ struct setup_release_c {
+     types e;
+     e.unpack(bref);
+     set(e);
+-    switch (type_) {
++    switch (type_.value) {
+       case types::release:
+         break;
+       case types::setup:
+@@ -1750,7 +1750,7 @@ struct setup_release_c {
+   void to_json(json_writer& j) const
+   {
+     j.start_obj();
+-    switch (type_) {
++    switch (type_.value) {
+       case types::release:
+         break;
+       case types::setup:
+@@ -1802,7 +1802,7 @@ struct setup_release_c<std::array<T, N>> {
+   OCUDUASN_CODE pack(bit_ref& bref) const
+   {
+     type_.pack(bref);
+-    switch (type_) {
++    switch (type_.value) {
+       case types::release:
+         break;
+       case types::setup:
+@@ -1819,7 +1819,7 @@ struct setup_release_c<std::array<T, N>> {
+     types e;
+     e.unpack(bref);
+     set(e);
+-    switch (type_) {
++    switch (type_.value) {
+       case types::release:
+         break;
+       case types::setup:
+@@ -1834,7 +1834,7 @@ struct setup_release_c<std::array<T, N>> {
+   void to_json(json_writer& j) const
+   {
+     j.start_obj();
+-    switch (type_) {
++    switch (type_.value) {
+       case types::release:
+         break;
+       case types::setup:
+-- 
+2.55.0
+

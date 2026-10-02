@@ -1,0 +1,31 @@
+From 42b15a3783c6805a976f04f4eddabec4fa91d375 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:03:41 +0300
+Subject: [PATCH] mac: assemble the C-RNTI from the two bytes without le16toh
+
+mac_ul_sch_pdu.h builds the 16-bit C-RNTI from the two big-endian bytes
+of the CE and then passes it through le16toh(), a glibc <endian.h>
+macro that Darwin does not have. The value is already in host order at
+that point, so on a little-endian host the macro is the identity and
+on a big-endian host it would swap a correct value. Drop it and keep
+the explicit byte assembly, which is portable and correct on both.
+---
+ lib/mac/mac_ul/mac_ul_sch_pdu.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/mac/mac_ul/mac_ul_sch_pdu.h b/lib/mac/mac_ul/mac_ul_sch_pdu.h
+index 74cc950..3f8ca23 100644
+--- a/lib/mac/mac_ul/mac_ul_sch_pdu.h
++++ b/lib/mac/mac_ul/mac_ul_sch_pdu.h
+@@ -79,7 +79,7 @@ inline rnti_t decode_crnti_ce(byte_buffer_view payload)
+   }
+ 
+   // Conversion between Little Endian to RNTI value. See TS 38.321, 6.1.3.2 - C-RNTI MAC CE.
+-  return to_rnti(le16toh((uint16_t)payload[0] << 8U | payload[1]));
++  return to_rnti(static_cast<uint16_t>((payload[0] << 8U) | payload[1]));
+ }
+ 
+ } // namespace ocudu
+-- 
+2.55.0
+

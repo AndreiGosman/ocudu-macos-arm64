@@ -1,0 +1,35 @@
+From 341f0504ace2c544e990ba8fc0bbcaef25b6bbad Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:51:33 +0300
+Subject: [PATCH] tests: use an initial RTO inside the [min, max] range in
+ sctp_socket_test
+
+create_with_all_options set rto_initial=2 ms, rto_min=3 ms, rto_max=4 ms.
+The Linux kernel accepts that, it only checks min <= max. RFC 6458
+stacks such as usrsctp (libsctp-compat on macOS) apply min <= initial
+<= max and reject the set with EINVAL, which failed the test for a reason
+unrelated to what it checks. Use 3/2/4 ms, which every stack accepts.
+---
+ tests/unittests/gateways/sctp_socket_test.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/tests/unittests/gateways/sctp_socket_test.cpp b/tests/unittests/gateways/sctp_socket_test.cpp
+index 65ec3a0..ae4edf9 100644
+--- a/tests/unittests/gateways/sctp_socket_test.cpp
++++ b/tests/unittests/gateways/sctp_socket_test.cpp
+@@ -308,8 +308,10 @@ TEST_F(sctp_socket_test, create_with_all_options)
+   params.reuse_addr         = true;
+   params.non_blocking_mode  = true;
+   params.rx_timeout         = std::chrono::seconds(1);
+-  params.rto_initial        = std::chrono::milliseconds(2);
+-  params.rto_min            = std::chrono::milliseconds(3);
++  // Keep rto_min <= rto_initial <= rto_max: RFC 6458 stacks such as usrsctp reject an initial RTO outside the
++  // [min, max] range with EINVAL, while the Linux kernel only checks min <= max.
++  params.rto_initial        = std::chrono::milliseconds(3);
++  params.rto_min            = std::chrono::milliseconds(2);
+   params.rto_max            = std::chrono::milliseconds(4);
+   params.init_max_attempts  = 5;
+   params.max_init_timeo     = std::chrono::milliseconds(6);
+-- 
+2.55.0
+

@@ -1,0 +1,84 @@
+From 147149934011681bb99872962590ef2eff7bdd87 Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 12:38:36 +0300
+Subject: [PATCH] tests: read SCTP address lists portably in sctp_socket_test
+
+The test fixture reads bound and peer address lists with
+getsockopt(SCTP_GET_LOCAL_ADDRS / SCTP_GET_PEER_ADDRS) into a struct
+sctp_getaddrs so that valgrind sees a fully initialised buffer. Those
+option names and that structure exist in lksctp only; RFC 6458 stacks
+such as usrsctp expose the lists through sctp_getladdrs() and
+sctp_getpaddrs(), which the fixture already mirrors.
+
+Keep the getsockopt path on Linux and, elsewhere, fetch the packed list
+with sctp_getladdrs()/sctp_getpaddrs(), copy it into the caller's buffer
+and free it. The option names keep selecting the list and take their
+Linux values where the header lacks them; the parsing code is unchanged.
+---
+ tests/unittests/gateways/sctp_socket_test.cpp | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/tests/unittests/gateways/sctp_socket_test.cpp b/tests/unittests/gateways/sctp_socket_test.cpp
+index 01c4a02..65ec3a0 100644
+--- a/tests/unittests/gateways/sctp_socket_test.cpp
++++ b/tests/unittests/gateways/sctp_socket_test.cpp
+@@ -15,6 +15,14 @@
+ 
+ using namespace ocudu;
+ 
++// lksctp-only option names, used here only to select the local or the peer list.
++#ifndef SCTP_GET_PEER_ADDRS
++#define SCTP_GET_PEER_ADDRS 108
++#endif
++#ifndef SCTP_GET_LOCAL_ADDRS
++#define SCTP_GET_LOCAL_ADDRS 109
++#endif
++
+ class sctp_socket_test : public ::testing::Test
+ {
+ protected:
+@@ -68,12 +76,41 @@ protected:
+   /// \return Number of addresses in the list, or -1 if it could not be retrieved.
+   static int get_sctp_addrs(int fd, int optname, sctp_addr_buf& buf, sockaddr** addrs, sctp_assoc_t assoc_id = 0)
+   {
++#ifdef __linux__
+     auto* getaddrs     = reinterpret_cast<sctp_getaddrs*>(buf.data());
+     getaddrs->assoc_id = assoc_id;
+     *addrs             = reinterpret_cast<sockaddr*>(getaddrs->addrs);
+ 
+     socklen_t len = sizeof(buf);
+     return ::getsockopt(fd, IPPROTO_SCTP, optname, buf.data(), &len) == 0 ? static_cast<int>(getaddrs->addr_num) : -1;
++#else
++    // SCTP_GET_LOCAL_ADDRS, SCTP_GET_PEER_ADDRS and struct sctp_getaddrs are lksctp-only. Use the portable
++    // sctp_getladdrs()/sctp_getpaddrs() and copy the packed list into the caller's buffer, which keeps the valgrind
++    // argument above moot here and the parsing below unchanged.
++    sockaddr* list = nullptr;
++    int       count =
++        optname == SCTP_GET_LOCAL_ADDRS ? ::sctp_getladdrs(fd, assoc_id, &list) : ::sctp_getpaddrs(fd, assoc_id, &list);
++    if (count <= 0 || list == nullptr) {
++      return -1;
++    }
++    size_t total = 0;
++    for (int i = 0; i < count; ++i) {
++      const auto* sa = reinterpret_cast<const sockaddr*>(reinterpret_cast<const char*>(list) + total);
++      total += sa->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
++    }
++    if (total > sizeof(buf)) {
++      count = -1;
++    } else {
++      std::memcpy(buf.data(), list, total);
++      *addrs = reinterpret_cast<sockaddr*>(buf.data());
++    }
++    if (optname == SCTP_GET_LOCAL_ADDRS) {
++      ::sctp_freeladdrs(list);
++    } else {
++      ::sctp_freepaddrs(list);
++    }
++    return count;
++#endif
+   }
+ 
+   /// Verify bound addresses using the SCTP local address list.
+-- 
+2.55.0
+

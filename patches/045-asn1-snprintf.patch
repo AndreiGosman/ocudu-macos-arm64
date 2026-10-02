@@ -1,0 +1,33 @@
+From 1399505e99bc0c85b73e5f92ba175a4726d584ee Mon Sep 17 00:00:00 2001
+From: Andrei Gosman <andrei.gosman@gmail.com>
+Date: Thu, 1 Oct 2026 14:07:28 +0300
+Subject: [PATCH] asn1: format hex digits with snprintf, not sprintf
+
+octet_string_helper::to_hex_string() formats each byte with
+std::sprintf into a small stack buffer. Darwin's libc marks sprintf
+deprecated and the project compiles with -Werror, so lib/asn1 did not
+build there. Use std::snprintf with the buffer size: two digits plus the
+terminator, the same three bytes the callers reserve.
+---
+ lib/asn1/asn1_utils.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/lib/asn1/asn1_utils.cpp b/lib/asn1/asn1_utils.cpp
+index 1bd7118..0328ab0 100644
+--- a/lib/asn1/asn1_utils.cpp
++++ b/lib/asn1/asn1_utils.cpp
+@@ -1048,9 +1048,10 @@ void octet_string_helper::to_octet_string(ocudu::byte_buffer& buf, uint64_t numb
+   }
+ }
+ 
++/// Writes the two hexadecimal digits of \c val and a terminating NUL into \c cstr, which must hold three bytes.
+ static void to_hex(char* cstr, uint8_t val)
+ {
+-  std::sprintf(cstr, "%02x", val);
++  std::snprintf(cstr, 3, "%02x", val);
+ }
+ 
+ std::string octet_string_helper::to_hex_string(ocudu::span<const uint8_t> buf)
+-- 
+2.55.0
+
